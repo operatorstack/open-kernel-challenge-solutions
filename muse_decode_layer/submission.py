@@ -47,7 +47,7 @@ import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
-from triton.experimental.gluon.language.nvidia.ampere import async_copy as gcp  # c041 donor
+from triton.experimental.gluon.language.nvidia.ampere import async_copy as gcp
 from triton.experimental.gluon.language.nvidia.ampere import mbarrier as gmbar
 from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared, warpgroup_mma
 
@@ -144,16 +144,16 @@ SLICED_UNPOOL_MAX_TOKENS = 8
 UNPOOL_SLICE = HIDDEN // 8
 # MuseSpark1xFp4Experts' candidates, smallest first.
 BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
-# c004: programmatic dependent launch for this file's Triton kernels on SM90, as SGLang's kernels use.
+# Programmatic dependent launch for this file's Triton kernels on SM90, as SGLang's kernels use.
 _PDL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
 _PDL_KW = {"USE_PDL": True, "launch_pdl": True} if _PDL else {}
-GROUPED_MIN_TOKENS = 128  # c003: grouped NVFP4 kernels from this many tokens (verify-16/32 shapes) on SM90
+GROUPED_MIN_TOKENS = 128  # grouped NVFP4 kernels from this many tokens (verify-16/32 shapes) on SM90
 GROUPED_BT = 32
 ROPE_POSITIONS = 1 << 21
 ROPE_THETA = 500_000.0
 
 
-# ---- c001: fused glue kernels (everything else stays SGLang's) ------------------------------------
+# ---- fused glue kernels (everything else stays SGLang's) ------------------------------------
 
 @triton.jit
 def _qk_norm_rope_fp8_store_kernel(QKV, POS, COS_SIN, Q8, KC, VC, LOC, KS, VS, eps, stride_qkv, n_rows,
@@ -224,8 +224,8 @@ def _qk_norm_fp8_store(qkv, data, cfg, cos_sin):
     return q8
 
 
-# ---- lane B (B022): SGLang's _post_expert_norm_weighted_sum_kernel (fused_post_expert_norm_weighted_sum_triton.py),
-# body verbatim, plus PDL (as c017's GEMV) so the PDL-launched unpooler that follows can launch early ----
+# ---- SGLang's _post_expert_norm_weighted_sum_kernel (fused_post_expert_norm_weighted_sum_triton.py),
+# body verbatim, plus PDL (as in the one-token GEMV) so the PDL-launched unpooler that follows can launch early ----
 @triton.jit
 def _post_expert_ws_pdl_kernel(
     x_ptr,
@@ -262,7 +262,7 @@ def _post_expert_ws_pdl_kernel(
         if HAS_IDS:
             live = tl.load(ids_ptr + tok * TOPK + k) >= 0
         if live:
-            if KS > 1:  # lane B B044 (P19): W2's KS FP32 partials, summed and rounded as W2's BF16 output
+            if KS > 1:  # W2's KS FP32 partials, summed and rounded as W2's BF16 output
                 x = tl.zeros([BLOCK_H], dtype=tl.float32)
                 for s in tl.static_range(KS):
                     x += tl.load(x_ptr + base * KS + s * H + offs, mask=mask, other=0.0)
@@ -290,9 +290,9 @@ def _post_expert_ws_pdl_kernel(
     tl.store(out_ptr + tok * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-# ---- claude-moe FG1 revision 1 (tower/PREREG-decode-FG1.md fallback): slot-parallel rstd + PDL elementwise combine
+# ---- post-expert finalize, slot-parallel form: slot-parallel rstd + PDL elementwise combine
 FG1R1_BH = 512
-FG1R1_TS = {8, 16, 32, 128}  # token counts served by revision 1 (None = every T); per-T merge with revision 2 is a table edit
+FG1R1_TS = {8, 16, 32, 128}  # token counts served by this form (None = every T); others use _post_expert_ws_pdl_kernel
 
 
 @triton.jit
@@ -308,7 +308,7 @@ def _pe_rstd_kernel(x_ptr, w_ptr, r_ptr, ids_ptr, TOPK: tl.constexpr, H: tl.cons
     if tl.load(ids_ptr + tok * TOPK + k) >= 0:
         w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         base = (tok * TOPK + k) * H
-        if KS > 1:  # W2's KS FP32 partials, summed in split order and rounded as W2's BF16 output (as the parent)
+        if KS > 1:  # W2's KS FP32 partials, summed in split order and rounded as W2's BF16 output (as in _post_expert_ws_pdl_kernel)
             x = tl.zeros([BLOCK_H], dtype=tl.float32)
             for s in tl.static_range(KS):
                 x += tl.load(x_ptr + base * KS + s * H + offs, mask=mask, other=0.0)
@@ -362,9 +362,9 @@ def _post_expert_weighted_sum(y, topk_weights, norm_weight, local_ids):
     back to ~10 torch ops below 32 tokens)."""
     tokens, topk, hidden = y.shape
     out = torch.empty((tokens, hidden), dtype=y.dtype, device=y.device)
-    if FG1R1_TS is None or tokens in FG1R1_TS:  # FG1 rev1 (fixed-shape branch on T)
+    if FG1R1_TS is None or tokens in FG1R1_TS:  # slot-parallel form (fixed-shape branch on T)
         return _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, 1)
-    _post_expert_ws_pdl_kernel[(tokens,)](  # lane B B022: SGLang's kernel + PDL
+    _post_expert_ws_pdl_kernel[(tokens,)](  # SGLang's kernel + PDL
         y, norm_weight, topk_weights, out, local_ids, TOPK=topk, H=hidden, eps=POST_NORM_EPS,
         APPLY_NORM=True, HAS_WEIGHT=True, WEIGHT_FIRST=True, HAS_IDS=True,
         BLOCK_H=triton.next_power_of_2(hidden), num_warps=8, num_stages=2, **_PDL_KW)
@@ -372,11 +372,11 @@ def _post_expert_weighted_sum(y, topk_weights, norm_weight, local_ids):
 
 
 def _post_expert_weighted_sum_ks(y, topk_weights, norm_weight, local_ids, ks):
-    """lane B B044 (P19): y = W2's FP32 partials [tokens * TOPK, ks, H]; BF16 output as SGLang's."""
+    """y = W2's FP32 partials [tokens * TOPK, ks, H]; BF16 output as SGLang's."""
     tokens, topk = local_ids.shape
     hidden = y.shape[-1]
     out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=y.device)
-    if FG1R1_TS is None or tokens in FG1R1_TS:  # FG1 rev1 (fixed-shape branch on T)
+    if FG1R1_TS is None or tokens in FG1R1_TS:  # slot-parallel form (fixed-shape branch on T)
         return _fg1r1(y, topk_weights, norm_weight, local_ids, out, tokens, topk, hidden, ks)
     _post_expert_ws_pdl_kernel[(tokens,)](
         y, norm_weight, topk_weights, out, local_ids, TOPK=topk, H=hidden, eps=POST_NORM_EPS,
@@ -462,7 +462,7 @@ def _rms_norm_local_ids_kernel(X, W, OUT, eps, IDS, LS, LOCAL, SORTED, EXPERT_ID
             tl.debug_barrier()
             tl.store(SORTED + excl + rank, offs_p.to(tl.int32), mask=mask_p)
             return
-    if DO_LS:  # lane B B018: local_start into the one-token path's slot buffer (was a separate DtoD copy)
+    if DO_LS:  # local_start into the one-token path's slot buffer (saves a separate device-to-device copy)
         if row == 0:
             tl.store(LSOUT, tl.load(LS))
     offs = tl.arange(0, H)
@@ -475,13 +475,13 @@ def _rms_norm_local_ids_kernel(X, W, OUT, eps, IDS, LS, LOCAL, SORTED, EXPERT_ID
     tl.store(LOCAL + row * TOPK + k, tl.where(rel < N_LOCAL, rel, -1))
 
 
-ALIGN_IN_NORM_MAX_SLOTS = 64  # c007: SGLang's single-CTA align runs inside the norm kernel up to here
-SORT_ALIGN_MAX_SLOTS = 256  # c008: sort-based single-CTA align inside the norm kernel up to here (T <= 32)
+ALIGN_IN_NORM_MAX_SLOTS = 64  # SGLang's single-CTA align runs inside the norm kernel up to here
+SORT_ALIGN_MAX_SLOTS = 256  # sort-based single-CTA align inside the norm kernel up to here (T <= 32)
 
 
-MARLIN_BLOCK_CAP_MIN_TOKENS = 128  # c013: at verify-16/32 sizes cap Marlin's block at 32 rows
+MARLIN_BLOCK_CAP_MIN_TOKENS = 128  # at verify-16/32 sizes cap Marlin's block at 32 rows
 MARLIN_BLOCK_CAP = 32
-MARLIN_BLOCK_CAP_LARGE = 48  # c029: from 256 tokens (verify-32) 48-row blocks (m014)
+MARLIN_BLOCK_CAP_LARGE = 48  # from 256 tokens (verify-32) 48-row blocks
 
 
 def _marlin_block_size(num_tokens):
@@ -524,7 +524,7 @@ def _rms_norm_local_ids(x, w, eps, topk_ids, local_start, want_align=True, ls_ou
     return out, local, align
 
 
-# ---- c003: grouped NVFP4 expert GEMMs for large token counts --------------------------------------
+# ---- grouped NVFP4 expert GEMMs for large token counts --------------------------------------
 # Swap-AB tiles: the MMA's M side is 64 weight rows of one expert, the N side is up to 32 token-slots
 # routed to it (moe_align_block_size order), so an expert with 20 tokens fills 20 of 32 columns instead
 # of a padded 48/64-row Marlin block. Weights are the original NVFP4 tensors; E2M1 x E4M3 is exact in
@@ -713,8 +713,8 @@ def moe_nvfp4(x, w13, w13_sf, w13_gs, w2, w2_sf, w2_gs, sorted_ids, block_expert
 @triton.jit
 def _gemv_kernel(X, W, OUT, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, USE_PDL: tl.constexpr = False,
                  PREF: tl.constexpr = False):
-    """One token: out[n] = sum_k x[k] w[n, k], BF16 in, FP32 accumulation, BF16 out (c017)."""
-    if USE_PDL and PREF:  # segment C P2 (d051): W is a constant weight, not the producer's output, so this CTA's W lines
+    """One token: out[n] = sum_k x[k] w[n, k], BF16 in, FP32 accumulation, BF16 out."""
+    if USE_PDL and PREF:  # W is a constant weight, not the producer's output, so this CTA's W lines
         # are prefetched into L2 before the producer finishes (PDL early launch); the loads and arithmetic below are unchanged
         pr = tl.program_id(0) * BN + tl.arange(0, BN)
         lines = tl.arange(0, K // 64)  # one 128-byte line = 64 BF16
@@ -735,10 +735,10 @@ def _gemv_kernel(X, W, OUT, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     tl.store(OUT + rn, tl.sum(acc, axis=1).to(tl.bfloat16))
 
 
-GEMV_CFG = {8192: (1, 512, 8), 1024: (16, 256, 8), 4096: (1, 2048, 4)}  # K -> (BN, BK, warps), H200 sweep h001
+GEMV_CFG = {8192: (1, 512, 8), 1024: (16, 256, 8), 4096: (1, 2048, 4)}  # K -> (BN, BK, warps), from an H200 sweep
 
 
-# ---- c022: one-launch split-K router for T > 8 (BF16 hi + lo of the FP32 router, FP32 accumulation) ----
+# ---- one-launch split-K router for T > 8 (BF16 hi + lo of the FP32 router, FP32 accumulation) ----
 @triton.jit
 def router_hilo_kernel(X, HI, LO, OUT, T, K: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                        BK: tl.constexpr, KS: tl.constexpr):
@@ -762,7 +762,7 @@ def router_hilo_kernel(X, HI, LO, OUT, T, K: tl.constexpr, N: tl.constexpr, BM: 
 def _router_hilo(x, hi_t, lo_t):
     t, k = x.shape
     n = hi_t.shape[1]
-    # c039: tiles from an H200 sweep (h018-router-hilo); the 16/32-token rows were already within noise of the best
+    # tiles from an H200 sweep; the 16/32-token rows were already within noise of the best
     if t <= 64:
         bm, bn, bk, ks, nw, ns = 16, 32, 128, 32, 4, 3
     elif t <= 128:
@@ -778,7 +778,7 @@ def _router_hilo(x, hi_t, lo_t):
 
 
 
-# ---- E1 factor B: kernels verbatim from attention_decode 49b45770 ----
+# ---- split-K full-attention decode kernels (adapted from the muse_attention_decode kernels) ----
 
 @triton.jit
 def _full_partition_kernel(Q, K, V, PT, POS, KS, VS, PART, LSE,
@@ -851,7 +851,7 @@ def _merge_full_kernel(PART, LSE, O, HQ: tl.constexpr, HK: tl.constexpr,
 
 
 def _b_full_attention(q, data):
-    """49b45770's full_attention for single-token full-attention decode (64 partitions, then merge)."""
+    """full_attention for single-token full-attention decode (64 partitions, then merge)."""
     cfg = data["config"]
     hq, hk, length = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["q_len"]
     tokens = cfg["batch"] * length
@@ -866,14 +866,14 @@ def _b_full_attention(q, data):
         data["page_table"], data["positions"], data["k_scale"], data["v_scale"], partial, lse,
         hq, hk, length, cfg["page_size"], data["page_table"].stride(0),
         cfg["sm_scale"] * cfg["qk_scale_factor"], group, partitions, partition_tokens,
-        max(16, triton.next_power_of_2(group)), 128, num_warps=4, num_stages=3)  # c035: 3 stages (h007/h008)
+        max(16, triton.next_power_of_2(group)), 128, num_warps=4, num_stages=3)  # 3 stages (measured on the H200)
     _merge_full_kernel[(tokens, hk)](partial, lse, out, hq, hk, group,
         triton.next_power_of_2(group), partitions, num_warps=8)
     return out
 
 
-# ---- lane B (B007): full-attention verify blocks (q_len 8) as one 64-row tile per request and KV head ----
-# c040's _full_partition_kernel runs one program per token: at q_len 8 the 8 tokens of a request re-read the same
+# ---- full-attention verify blocks (q_len 8) as one 64-row tile per request and KV head ----
+# _full_partition_kernel runs one program per token: at q_len 8 the 8 tokens of a request re-read the same
 # keys. Here one program per (request, KV head, split) holds the request's L tokens x GROUP query heads as one
 # [L * GROUP, 64] tile (64 rows at L = 8, GROUP = 8), reads each key block once, and masks per row: token t of the
 # request attends to keys 0 .. positions[t] (causal within the draft). Same FP8 -> FP16 operands, FP32 softmax and
@@ -960,7 +960,7 @@ VERIFY_ATTN_WARPS = 4
 
 
 def _v_full_attention(q, data):
-    """Full-attention verify block: _verify_partition_kernel (one tile per request and KV head), then c040's merge."""
+    """Full-attention verify block: _verify_partition_kernel (one tile per request and KV head), then _merge_full_kernel."""
     cfg = data["config"]
     hq, hk, length, batch = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["q_len"], cfg["batch"]
     tokens = batch * length
@@ -981,8 +981,8 @@ def _v_full_attention(q, data):
         triton.next_power_of_2(group), partitions, num_warps=8)
     return out
 
-# ---- lane B (B008): full attention at small batch (B < 16): more splits, and a merge that loops over them ----
-# c040's _merge_full_kernel holds all NS x GROUP x 64 partials in registers (fine at NS = 64); with NS up to 512 this
+# ---- full attention at small batch (B < 16): more splits, and a merge that loops over them ----
+# _merge_full_kernel holds all NS x GROUP x 64 partials in registers (fine at NS = 64); with NS up to 512 this
 # merge streams them: one pass over the splits with a running max / sum (the same log-sum-exp combination).
 @triton.jit
 def _merge_loop_kernel(PART, LSE, O, HQ: tl.constexpr, HK: tl.constexpr, GROUP: tl.constexpr, BG: tl.constexpr,
@@ -1028,12 +1028,12 @@ def _merge_vec_kernel(PART, LSE, O, HQ: tl.constexpr, HK: tl.constexpr, GROUP: t
     tl.store(O + (token * HQ + kvhead * GROUP + g) * 64 + d, result)
 
 
-SMALL_FULL_PARTITIONS = {1: 128, 8: 128}  # q_len -> splits at batch < 16 (lane B hb018)
+SMALL_FULL_PARTITIONS = {1: 128, 8: 128}  # q_len -> splits at batch < 16 (measured on the H200)
 SMALL_FULL_BN = 128
 
 
 def _s_full_attention(q, data, partitions=None):
-    """Full attention at small batch: c040's one-token split kernel (q_len 1) or the verify tile kernel (q_len 8)
+    """Full attention at small batch: the one-token split kernel (q_len 1) or the verify tile kernel (q_len 8)
     over `partitions` splits per request and KV head, then the streaming merge."""
     cfg = data["config"]
     hq, hk, length, batch = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["q_len"], cfg["batch"]
@@ -1062,18 +1062,18 @@ SMALL_FULL_MAX_BATCH = 1  # full layers at q_len 1 / 8 with at most this many re
 VERIFY_ATTN_MIN_BATCH = 1073741824  # verify blocks of this many requests or more take this path
 
 
-# ---- c033: small-M dense projections (8-32 tokens). Swap-AB tiles: BN weight rows on the MMA M side, the tokens
+# ---- small-M dense projections (8-32 tokens). Swap-AB tiles: BN weight rows on the MMA M side, the tokens
 # padded to BM on the N side, FP32 accumulation (split-K into an FP32 buffer + reduce where measured faster), BF16 out.
 @triton.jit
 def _gemm_swap_kernel(X, W, OUT, M, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr,
                       BK: tl.constexpr, USE_PDL: tl.constexpr = False, PREF: tl.constexpr = False):
-    if USE_PDL and PREF:  # segment C P3 (d051): this CTA's constant W lines into L2 before the producer finishes (as P2)
+    if USE_PDL and PREF:  # this CTA's constant W lines into L2 before the producer finishes (as in the one-token GEMV)
         pr = tl.program_id(0) * BN + tl.arange(0, BN)
         lines = tl.arange(0, K // 64)  # one 128-byte line = 64 BF16
         pp = (W + pr[:, None] * K + lines[None, :] * 64).to(tl.int64)
         tl.inline_asm_elementwise("prefetch.global.L2 [$1]; mov.u32 $0, 0;", "=r,l", [pp], dtype=tl.int32,
                                   is_pure=False, pack=1)
-    if USE_PDL:  # lane B B021: as c017's GEMV: wait for the producer grid, then let the next kernel launch
+    if USE_PDL:  # as in the one-token GEMV: wait for the producer grid, then let the next kernel launch
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     pn = tl.program_id(0)
@@ -1091,7 +1091,7 @@ def _gemm_swap_kernel(X, W, OUT, M, N: tl.constexpr, K: tl.constexpr, BN: tl.con
 @triton.jit
 def _gemm_swap_splitk_kernel(X, W, P, M, N: tl.constexpr, K: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr,
                              BK: tl.constexpr, SPLIT: tl.constexpr, USE_PDL: tl.constexpr = False):
-    if USE_PDL:  # lane B B021: as c017's GEMV: wait for the producer grid, then let the next kernel launch
+    if USE_PDL:  # as in the one-token GEMV: wait for the producer grid, then let the next kernel launch
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     pn = tl.program_id(0)
@@ -1110,7 +1110,7 @@ def _gemm_swap_splitk_kernel(X, W, P, M, N: tl.constexpr, K: tl.constexpr, BN: t
 
 @triton.jit
 def _splitk_reduce_kernel(P, OUT, MN, SPLIT: tl.constexpr, BLOCK: tl.constexpr, USE_PDL: tl.constexpr = False):
-    if USE_PDL:  # lane B B021: as c017's GEMV: wait for the producer grid, then let the next kernel launch
+    if USE_PDL:  # as in the one-token GEMV: wait for the producer grid, then let the next kernel launch
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -1121,8 +1121,8 @@ def _splitk_reduce_kernel(P, OUT, MN, SPLIT: tl.constexpr, BLOCK: tl.constexpr, 
     tl.store(OUT + o, a.to(tl.bfloat16), mask=m)
 
 
-# (N, K, M) -> (BN, BK, SPLIT, stages), H200 sweep h002; lane B B087: the T = 32 pooler at BN 64 / 4 stages (64 CTAs, same K
-# order, raw-byte bitwise), chosen IN-LAYER (rotated A/B, pods a and d), where it beats (32, 256, 1, 5) under the co-running router
+# (N, K, M) -> (BN, BK, SPLIT, stages), from an H200 sweep; the T = 32 pooler runs BN 64 / 4 stages (64 CTAs, same K
+# order, bitwise-identical output), chosen in the full layer, where it beats (32, 256, 1, 5) next to the co-running router
 SWAP_CFG = {(2304, 8192, 8): (128, 128, 4, 5), (2304, 8192, 16): (128, 128, 4, 4), (2304, 8192, 32): (128, 128, 4, 5),
             (8192, 1024, 8): (64, 256, 1, 5), (8192, 1024, 16): (64, 128, 1, 5), (8192, 1024, 32): (64, 128, 1, 5),
             (4096, 8192, 8): (64, 128, 4, 3), (4096, 8192, 16): (32, 256, 1, 5), (4096, 8192, 32): (64, 256, 1, 4),
@@ -1144,7 +1144,7 @@ def _gemm_swap(x, w, cfg, pref=False):
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if split == 1:
         _gemm_swap_kernel[(n // bn,)](x, w, out, m, N=n, K=k, BN=bn, BM=bm, BK=bk, num_warps=4, num_stages=stages,
-                                      PREF=pref, **_PDL_KW)  # P3/P4: o-proj at sliding batch 1 only (kernel_fn)
+                                      PREF=pref, **_PDL_KW)  # L2 weight prefetch: o-proj at sliding batch 1 only (kernel_fn)
     else:
         p = torch.empty((split, m, n), dtype=torch.float32, device=x.device)
         _gemm_swap_splitk_kernel[(n // bn, split)](x, w, p, m, N=n, K=k, BN=bn, BM=bm, BK=bk, SPLIT=split,
@@ -1155,7 +1155,7 @@ def _gemm_swap(x, w, cfg, pref=False):
 
 
 
-# ---- c036: 8-token FP32 router, verbatim from bf16_proj aa2862cc ----
+# ---- 8-token FP32 router ----
 
 @triton.jit
 def _router_eight_tokens(X, W, Y, K: tl.constexpr, N: tl.constexpr,
@@ -1175,14 +1175,14 @@ def _router_eight_tokens(X, W, Y, K: tl.constexpr, N: tl.constexpr,
 
 
 def _router_eight(router_input, w):
-    """aa2862cc's 8-token router: FP32 x . FP32 w per output column, one program per router column."""
+    """8-token router: FP32 x . FP32 w per output column, one program per router column."""
     n = w.shape[0]
     out = torch.empty((8, n), device=w.device, dtype=torch.float32)
     _router_eight_tokens[(n,)](router_input, w, out, router_input.shape[1], n, router_input.stride(0),
                                router_input.stride(1), w.stride(0), TILE_K=1024, num_warps=8)
     return out
 
-# ---- c041: attention_decode fd6a5dd2's Gluon full decode (verbatim) ----
+# ---- Gluon full-attention decode (adapted from the muse_attention_decode kernels) ----
 _COUNTERS = {}
 
 
@@ -1584,10 +1584,10 @@ def _counter(n, device):
 
 
 # Fused-path launch shape per layer kind: keys per tile, warps, pipeline stages, most splits per unit.
-# Tuned on an H200 (SM90, the judge's toolchain) by per-case sweeps against the previous shapes: 128-key tiles
+# Tuned on an H200 (SM90, the judge's toolchain) by per-case sweeps against the previous shapes.
 
 
-# the donor's FUSED_CFG[('full', 1)] Gluon launch fields
+# the Gluon kernel's FUSED_CFG[('full', 1)] launch fields
 _G_FC = dict(g_block_n=128, g_stages=3, g_warps=4, g_per_sm=4)
 
 _G_VFC = dict(gv_block_n=128, gv_stages=4, gv_split=8, gv_pr=24, gv_maxnreg=128,
@@ -1639,8 +1639,8 @@ def _gluon_full_decode(data, cfg, qkv, tokens, fc):
     return out.view(batch, 1, hq * d)
 
 
-# ---- c042 part A: attention c043 (53532caa) sliding fused attention, verbatim ----
-MERGE_ELEMS = tl.constexpr(16384)   # partial elements loaded per step of the last-arrival merge (h058/h059: 4096 -> 16384
+# ---- fused attention for sliding and full layers (adapted from the muse_attention_decode kernels) ----
+MERGE_ELEMS = tl.constexpr(16384)   # partial elements loaded per step of the last-arrival merge (raised from 4096 to 16384 on the H200)
 
 @triton.jit
 def _combine_ml(part_o, part_ml, first, count, r, dd, ROWS: tl.constexpr, D: tl.constexpr, NP2: tl.constexpr):
@@ -1716,7 +1716,7 @@ def _fused_attn(qkv_ptr, loc_ptr, cos_sin_ptr, ks_ptr, vs_ptr, k_cache, v_cache,
                 ROPE: tl.constexpr, GS: tl.constexpr, NG: tl.constexpr, NG2: tl.constexpr,
                 PREFETCH: tl.constexpr, NRB: tl.constexpr, QK8: tl.constexpr, GPRE: tl.constexpr,
                 USE_PDL: tl.constexpr = False):
-    if USE_PDL:  # segment C P1 (claude-attention d051): wait for the producer grid, then let the next kernel launch
+    if USE_PDL:  # wait for the producer grid, then let the next kernel launch
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     b = tl.program_id(0)
@@ -2066,7 +2066,7 @@ def _fused_attn_pair(qkv_ptr, loc_ptr, cos_sin_ptr, ks_ptr, vs_ptr, k_cache, v_c
 
 FUSED_CFG = {
     ("sliding", 1): dict(block_n=128, warps=4, stages=2, max_split=16, per_sm=4, qk8=False,
-                         small=dict(warps=8, max_split=32, per_sm=64, prefetch=True),  # H-21 (research-priorart)
+                         small=dict(warps=8, max_split=32, per_sm=64, prefetch=True),
                          big=dict(max_split=8, stages=3), big_min_batch=32),
     ("sliding", 8): dict(block_n=128, warps=4, stages=3, max_split=8, per_sm=4, row_blocks=1,
                          small=dict(block_n=128, stages=2, max_split=16, row_blocks=4, qk8=False, prefetch=True), big=dict(max_split=4), big_min_batch=32),
@@ -2129,11 +2129,11 @@ def _fused(data, cfg, qkv, tokens, cos_sin):
         HQ=hq, HKV=hkv, D=d, L=length, HPB=hpb, ROWS=rows, LP=max(16, triton.next_power_of_2(length)), PAGE=page,
         BLOCK_N=fc["block_n"], NSPLIT=nsplit, NSP2=triton.next_power_of_2(nsplit), SB=sb, WINDOW=window,
         ROPE=bool(cfg["rope_theta"]), GS=gs, NG=ng, NG2=triton.next_power_of_2(ng), PREFETCH=fc.get("prefetch", False), NRB=nrb, QK8=fc.get("qk8", True), GPRE=fc.get("gate_pre", True),
-        num_warps=fc["warps"], num_stages=fc["stages"], **(_PDL_KW if batch == 1 else {}))  # segment C P1: PDL at batch 1 (shape-only)
+        num_warps=fc["warps"], num_stages=fc["stages"], **(_PDL_KW if batch == 1 else {}))  # PDL at batch 1 (shape-only)
     return out.view(batch, length, hq * d)
 
 
-# ---- c042 part B: moe c166 (a4ea2bee) DIRECT-mode W13/W2, verbatim, renamed for the one-token path ----
+# ---- one-token (DIRECT-mode) grouped NVFP4 W13/W2 kernels (as in the muse_moe_w4a16 solution), renamed for this layer ----
 @gluon.jit
 def _w13_silu_d1(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
               K: gl.constexpr, I: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
@@ -2160,7 +2160,7 @@ def _w13_silu_d1(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, 
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
+        KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
         w_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
         rs, qs, gs_ = _idx3(BN, 4, 4, LS)
         s_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -2248,8 +2248,8 @@ def _w13_silu_d1s(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr,
               IL: gl.constexpr = False):
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    # claude-bf16 d1 (a1n 953d135f notrig): b1.5 TS early trigger removed in this d1 kernel (c654-trig-probe)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    # no early launch_dependents trigger in this one-token kernel
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     pid_k = gl.program_id(2)
@@ -2271,8 +2271,8 @@ def _w13_silu_d1s(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr,
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
-        # segment F (F1'): IL = f1, per (expert, n-tile) KB contiguous k-block records
+        KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
+        # IL = f1: per (expert, n-tile) KB contiguous k-block records
         # [gate codes BN*BK/2 | up codes BN*BK/2 | gate sf BN*BK/16 | up sf BN*BK/16], so a CTA's K-split is one contiguous
         # span instead of 4 DRAM streams (see _segf_layouts).
         RW: gl.constexpr = BN * 72 if IL else BN * 32               # int32 words per k-block record (18432 B)
@@ -2348,17 +2348,17 @@ def _w13_silu_d1s(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr,
                 acc_g = mma_v2(_decode_tile(wg, sg, BN, BK, L3, A_L), xb, acc_g)
                 acc_u = mma_v2(_decode_tile(wu, su, BN, BK, L3, A_L), xb, acc_u)
         last = True
-        if KS > 1:  # P8: split-K partials, last arriver reduces in a fixed order
+        if KS > 1:  # split-K partials, last arriver reduces in a fixed order
             n_p = gl.arange(0, BN, layout=gl.SliceLayout(1, mma))
             tile = pid_w * (I // BN) + pid_n
             pbase = part_ptr + (tile * KS + pid_k) * (2 * BN)
             gl.store(pbase + 0 * BN + n_p, gl.sum(acc_g, axis=1))
             gl.store(pbase + 1 * BN + n_p, gl.sum(acc_u, axis=1))
             gl.barrier()
-            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # moe-d1rel: release only (acquire by the last arriver)
+            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # release only (acquire by the last arriver)
             last = done == KS - 1
             if last:
-                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # moe-d1rel: acquire RMW on the counter's release sequence
+                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # acquire RMW on the counter's release sequence
                 z0 = seen - KS  # == 0 (all KS adds are in); reload addresses depend on the acquire, so it cannot be dropped
                 gl.barrier()
                 acc_g_s = gl.zeros([BN], gl.float32, layout=gl.SliceLayout(1, mma))
@@ -2383,7 +2383,7 @@ def _w13_silu_d1s(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr,
             gl.store(optr, inter.to(gl.bfloat16), mask=gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1))
 
 
-# ---- claude-bf16 A1 (inbox-193): d1 W13 with the pre-expert norm in its prologue ----
+# ---- one-token W13 with the pre-expert norm fused into its prologue ----
 @gluon.jit
 def _w13_silu_d1s_n(x_ptr, nw_ptr, ls_ptr, eps, dbg_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr, part_ptr, cnt_ptr,
               K: gl.constexpr, I: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
@@ -2393,21 +2393,21 @@ def _w13_silu_d1s_n(x_ptr, nw_ptr, ls_ptr, eps, dbg_ptr, w_ptr, sf_ptr, gs_ptr, 
               IL: gl.constexpr = False, DBG: gl.constexpr = False):
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    # claude-bf16 d1 (a1n 953d135f notrig): b1.5 TS early trigger removed in this d1 kernel (c654-trig-probe)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    # no early launch_dependents trigger in this one-token kernel
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     pid_k = gl.program_id(2)
     kb0 = pid_k * (K // KS)
     kb1 = kb0 + K // KS
     if DIRECT:  # M = 1: slot pid_w of the only token is one item of one row; no routing pass
-        ls = gl.load(ls_ptr)  # claude-bf16 A1: local_start from its own pointer (the norm's DO_LS wrote buf[0])
+        ls = gl.load(ls_ptr)  # local_start from its own pointer (the norm's DO_LS wrote buf[0])
         e = gl.load(work_ptr + pid_w) - ls
         active = (e >= 0) & (e < NLOC)
         e = e * active.to(gl.int32)
         r0 = pid_w
         r1 = pid_w + active.to(gl.int32)
-        if (pid_n == 0) & (pid_w == 0) & (pid_k == 0):  # A1: buf[0] = local_start for W2 (which waits for W13)
+        if (pid_n == 0) & (pid_w == 0) & (pid_k == 0):  # buf[0] = local_start for W2 (which waits for W13)
             gl.store(nwork_ptr, ls)
         if (pid_n == 0) & (pid_k == 0):  # this slot's local expert id, or -1, for the post-expert norm
             gl.store(nwork_ptr + 1 + pid_w, e + active.to(gl.int32) - 1)
@@ -2418,15 +2418,15 @@ def _w13_silu_d1s_n(x_ptr, nw_ptr, ls_ptr, eps, dbg_ptr, w_ptr, sf_ptr, gs_ptr, 
         r1 = gl.load(work_ptr + pid_w * 3 + 2)
     if active:
         gl.static_assert(XS and DIRECT and not SMB)
-        # claude-bf16 A1: the pre-expert norm's rstd, with the norm kernel's own layout and expressions (TTGIR
+        # the pre-expert norm's rstd, with the norm kernel's own layout and expressions (TTGIR
         # #blocked1 = BlockedLayout([8], [32], [4], [0]) over K = 4096; num_warps 4 as the norm kernel)
         LN: gl.constexpr = gl.BlockedLayout([8], [32], [4], [0])
         xr = gl.load(x_ptr + gl.arange(0, K, layout=LN)).to(gl.float32)
         rstd = gl.rsqrt(gl.sum(xr * xr, axis=0) / K + eps)
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
-        # segment F (F1'): IL = f1, per (expert, n-tile) KB contiguous k-block records
+        KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
+        # IL = f1: per (expert, n-tile) KB contiguous k-block records
         # [gate codes BN*BK/2 | up codes BN*BK/2 | gate sf BN*BK/16 | up sf BN*BK/16], so a CTA's K-split is one contiguous
         # span instead of 4 DRAM streams (see _segf_layouts).
         RW: gl.constexpr = BN * 72 if IL else BN * 32               # int32 words per k-block record (18432 B)
@@ -2502,17 +2502,17 @@ def _w13_silu_d1s_n(x_ptr, nw_ptr, ls_ptr, eps, dbg_ptr, w_ptr, sf_ptr, gs_ptr, 
                 acc_g = mma_v2(_decode_tile(wg, sg, BN, BK, L3, A_L), xb, acc_g)
                 acc_u = mma_v2(_decode_tile(wu, su, BN, BK, L3, A_L), xb, acc_u)
         last = True
-        if KS > 1:  # P8: split-K partials, last arriver reduces in a fixed order
+        if KS > 1:  # split-K partials, last arriver reduces in a fixed order
             n_p = gl.arange(0, BN, layout=gl.SliceLayout(1, mma))
             tile = pid_w * (I // BN) + pid_n
             pbase = part_ptr + (tile * KS + pid_k) * (2 * BN)
             gl.store(pbase + 0 * BN + n_p, gl.sum(acc_g, axis=1))
             gl.store(pbase + 1 * BN + n_p, gl.sum(acc_u, axis=1))
             gl.barrier()
-            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # moe-d1rel: release only (acquire by the last arriver)
+            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # release only (acquire by the last arriver)
             last = done == KS - 1
             if last:
-                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # moe-d1rel: acquire RMW on the counter's release sequence
+                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # acquire RMW on the counter's release sequence
                 z0 = seen - KS  # == 0 (all KS adds are in); reload addresses depend on the acquire, so it cannot be dropped
                 gl.barrier()
                 acc_g_s = gl.zeros([BN], gl.float32, layout=gl.SliceLayout(1, mma))
@@ -2561,7 +2561,7 @@ def _w2_d1(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_pt
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights
+        KB: gl.constexpr = K // BK  # tile-major weights
         w_off = (e * (N // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
         rs, qs, gs_ = _idx3(BN, 4, 4, LS)
         s_off = (e * (N // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -2627,12 +2627,12 @@ def _w2_d1s(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
         SMB: gl.constexpr = False, HOP: gl.constexpr = False,
               CHK: gl.constexpr = False, PF: gl.constexpr = False,
               DIRECT: gl.constexpr = False, NLOC: gl.constexpr = 32, KS: gl.constexpr = 1,
-              OV: gl.constexpr = 0,  # moe-w2ov: 0 = parent K loop
-              IL: gl.constexpr = False):  # segment F (F1)
+              OV: gl.constexpr = 0,  # 0 = the plain K loop
+              IL: gl.constexpr = False):  # IL: contiguous per-block code+scale records
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    # claude-bf16 d1 (a1n 953d135f notrig): b1.5 TS early trigger removed in this d1 kernel (c654-trig-probe)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    # no early launch_dependents trigger in this one-token kernel
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     pid_k = gl.program_id(2)
@@ -2652,8 +2652,8 @@ def _w2_d1s(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights
-        # segment F (F1): IL = il2, codes then scales per 9216 B block (one stream per CTA instead of two)
+        KB: gl.constexpr = K // BK  # tile-major weights
+        # IL = il2: codes then scales per 9216 B block (one stream per CTA instead of two)
         BLKW: gl.constexpr = BN * 36 if IL else BN * 32
         BLKB: gl.constexpr = BN * 144 if IL else BN * 16
         S0: gl.constexpr = BN * 128 if IL else 0
@@ -2673,7 +2673,7 @@ def _w2_d1s(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
         if PF:
             wq_n = gl.load(wp + w_off + (kb0 // BK) * BLKW)
             sq_n = gl.load(sf_ptr + s_off + (kb0 // BK) * BLKB)
-        if OV > 0:  # moe-w2ov (d1 DIRECT, XS, PF, 2 chunks per CTA): activation staging hoisted, barrier-free decode/MMA block
+        if OV > 0:  # OV schedule (one-token DIRECT, XS, PF, 2 chunks per CTA): activation staging hoisted, barrier-free decode/MMA block
             gl.static_assert((K // KS) // BK == 2)
             wq0 = wq_n
             sq0 = sq_n
@@ -2720,16 +2720,16 @@ def _w2_d1s(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
                         xb = _x_tile(gl.load(a_ptr + x_off + k0, mask=x_mask, other=0.0), BM, BK, B_L)
                     acc = mma_v2(_decode_tile(wq, sq, BN, BK, L3, A_L), xb, acc)
         last = True
-        if KS > 1:  # P8: split-K partials, last arriver reduces in a fixed order
+        if KS > 1:  # split-K partials, last arriver reduces in a fixed order
             n_p = gl.arange(0, BN, layout=gl.SliceLayout(1, mma))
             tile = pid_w * (N // BN) + pid_n
             pbase = part_ptr + (tile * KS + pid_k) * (1 * BN)
             gl.store(pbase + 0 * BN + n_p, gl.sum(acc, axis=1))
             gl.barrier()
-            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # moe-d1rel: release only (acquire by the last arriver)
+            done = gl.atomic_add(cnt_ptr + tile, 1, sem="release")  # release only (acquire by the last arriver)
             last = done == KS - 1
             if last:
-                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # moe-d1rel: acquire RMW on the counter's release sequence
+                seen = gl.atomic_add(cnt_ptr + tile, 0, sem="acquire")  # acquire RMW on the counter's release sequence
                 z0 = seen - KS  # == 0 (all KS adds are in); reload addresses depend on the acquire, so it cannot be dropped
                 gl.barrier()
                 acc_s = gl.zeros([BN], gl.float32, layout=gl.SliceLayout(1, mma))
@@ -2754,19 +2754,19 @@ def _w2_d1s(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
 
 
 def _experts_d1(x, topk_ids, topk_weights, local_start, state):
-    """moe c166's _decode1_direct for this layer: each of the token's 8 slots is one work item read from topk_ids
+    """_decode1_direct (one-token grouped experts) for this layer: each of the token's 8 slots is one work item read from topk_ids
     (no routing pass); slot 0 of the buffer holds this rank's first expert id, slots 1..8 receive the per-slot local
     ids (or -1) written by W13, which the post-expert finalize reads."""
     g = state["grouped"]
     H = x.shape[1]
     I = D_EXPERT
     buf = state["d1_buf"]
-    # lane B B018: buf[0] = local_start is written by _rms_norm_local_ids_kernel (ls_out) just before this
+    # buf[0] = local_start is written by _rms_norm_local_ids_kernel (ls_out) just before this
     ids = topk_ids.to(torch.int32).contiguous()
     inter = torch.empty((TOP_K, I), dtype=torch.bfloat16, device=x.device)
-    ks13, ks2 = D1_KS  # P8: split-K over the K loop (shape constants)
-    f1 = SEGF_F1 and g["segf_ok"]  # F-B: parent layout and kernels if the prepare-time inverse check failed
-    w13c, w13s = g["chain13"] if f1 else (g["w13"], g["w13_sf"])  # segment F (F1)
+    ks13, ks2 = D1_KS  # split-K over the K loop (shape constants)
+    f1 = SEGF_F1 and g["segf_ok"]  # fallback: original layout and kernels if the prepare-time inverse check failed
+    w13c, w13s = g["chain13"] if f1 else (g["w13"], g["w13_sf"])  # per-(expert, tile) contiguous k-block records
     w2c, w2s = g["il2"] if f1 else (g["w2"], g["w2_sf"])
     _w13_silu_d1s[(I // BN, TOP_K, ks13)](x, w13c, w13s, g["w13_gs"], state["iota8"], ids, buf, inter,
                                           state["d1s_part13"], state["d1s_cnt13"],
@@ -2782,7 +2782,7 @@ def _experts_d1(x, topk_ids, topk_weights, local_start, state):
 
 
 def _experts_d1_n(x_raw, topk_ids, topk_weights, local_start, state, dbg=None):
-    """claude-bf16 A1: _experts_d1 with the pre-expert norm inside W13's prologue (x_raw = the pooler output)."""
+    """_experts_d1 with the pre-expert norm inside W13's prologue (x_raw = the pooler output)."""
     g = state["grouped"]
     H = x_raw.shape[1]
     I = D_EXPERT
@@ -2790,8 +2790,8 @@ def _experts_d1_n(x_raw, topk_ids, topk_weights, local_start, state, dbg=None):
     ids = topk_ids.to(torch.int32).contiguous()
     inter = torch.empty((TOP_K, I), dtype=torch.bfloat16, device=x_raw.device)
     ks13, ks2 = D1_KS
-    f1 = SEGF_F1 and g["segf_ok"]  # F-B: parent layout and kernels if the prepare-time inverse check failed
-    w13c, w13s = g["chain13"] if f1 else (g["w13"], g["w13_sf"])  # segment F (F1)
+    f1 = SEGF_F1 and g["segf_ok"]  # fallback: original layout and kernels if the prepare-time inverse check failed
+    w13c, w13s = g["chain13"] if f1 else (g["w13"], g["w13_sf"])  # per-(expert, tile) contiguous k-block records
     w2c, w2s = g["il2"] if f1 else (g["w2"], g["w2_sf"])
     _w13_silu_d1s_n[(I // BN, TOP_K, ks13)](x_raw, state["pre_expert_w"], local_start, RMS_EPS, dbg if dbg is not None else buf,
                                             w13c, w13s, g["w13_gs"], state["iota8"], ids, buf, inter,
@@ -2809,30 +2809,30 @@ def _experts_d1_n(x_raw, topk_ids, topk_weights, local_start, state, dbg=None):
 
 
 def _gemm(x, w, out=None, pref=False):
-    """SGLang's dispatch, except a single token goes to a bandwidth-bound Triton GEMV (c017)."""
+    """SGLang's dispatch, except a single token goes to a bandwidth-bound Triton GEMV."""
     if x.shape[0] == 1 and x.is_contiguous() and w.is_contiguous():
         n, k = w.shape
         bn, bk, nw = GEMV_CFG.get(k, (8, 512, 4))
         if out is None:
             out = torch.empty((1, n), dtype=torch.bfloat16, device=x.device)
-        _gemv_kernel[(n // bn,)](x, w, out, K=k, BN=bn, BK=bk, num_warps=nw, PREF=pref, **_PDL_KW)  # P2/P4: o-proj at sliding batch 1 only (kernel_fn)
+        _gemv_kernel[(n // bn,)](x, w, out, K=k, BN=bn, BK=bk, num_warps=nw, PREF=pref, **_PDL_KW)  # L2 weight prefetch: o-proj at sliding batch 1 only (kernel_fn)
         return out
     if out is not None:
         return torch.mm(x, w.t(), out=out)
     cfg = SWAP_CFG.get((w.shape[0], w.shape[1], x.shape[0]))
-    if cfg is not None and x.is_contiguous() and w.is_contiguous():  # c033: fixed-shape branch
+    if cfg is not None and x.is_contiguous() and w.is_contiguous():  # fixed-shape branch
         return _gemm_swap(x, w, cfg, pref)
     return _bf16_gemm_dispatch_impl(x, w, None)
 
 
-# ---- lane B: bf16_proj c043 (4ee1bd06) projection block, verbatim from "claude-bf16 small-m streaming block" to
-# "end of block". Served only at LANEB_DONOR's (layer, tokens) pairs (fixed-shape branch), measured faster than this
-# layer's own path on the H200 (lane B B001). Its split-K kernels share one partials buffer and
+# ---- projection kernels adapted from the muse_bf16_proj solution (this block through "end of block"). Served only at
+# LANEB_DONOR's (layer, tokens) pairs (fixed-shape branch), measured faster than this layer's own path on the H200.
+# Its split-K kernels share one partials buffer and
 # self-resetting counters: they run only on the main stream, one at a time (the side stream's router never uses them).
-# ---- claude-bf16 small-m streaming block (names prefixed _cbf_ / CBF_) ----
+# ---- small-m streaming block (names prefixed _cbf_ / CBF_) ----
 # Swap-AB MMA weight streaming with K split into ranges of whole blocks and an in-kernel last-arriver
 # reduction (self-resetting counters). CBF_ENABLED lists the (layer, m bucket) cases this block serves;
-# everything else returns None and runs aa2862cc's path.
+# everything else returns None and runs the base path.
 
 
 @triton.jit
@@ -2906,9 +2906,9 @@ def _cbf_launch(x, w, n, state, cfg, block_m):
 
 # Streaming MMA: (layer, m bucket 16 = 1-16 tokens, 32 = 17-32 tokens) -> BLOCK_N, BLOCK_K, SPLIT_K, warps, stages.
 CBF_STREAM = {
-    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 at m=1, job 7c81bace)
-    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200 plane 1.08 / 1.10 at m8 / m16, job h05)
-    ("o", 32): (64, 128, 1, 4, 4),            # H200 plane 1.08 at m32 (job h05)
+    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 vs SGLang at m=1)
+    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200: 1.08 / 1.10 vs SGLang at m8 / m16)
+    ("o", 32): (64, 128, 1, 4, 4),            # H200: 1.08 vs SGLang at m32
 }
 # Cases served: qkv_gate at 1-16 tokens (one token runs the same 16-wide MMA tile).
 CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
@@ -2917,7 +2917,7 @@ CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 except Exception:  # older Triton: the pointer kernel is used everywhere
-    TensorDescriptor = None  # older Triton: the pooler case keeps aa2862cc's path
+    TensorDescriptor = None  # older Triton: the pooler case keeps the base path
 
 
 @triton.jit
@@ -2989,12 +2989,12 @@ def _cbf_launch_tma(x, w, w2, n, state, cfg, block_m, out_dtype):
 
 # layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, served at 2-32 tokens (BLOCK_M = tokens rounded up
 # to a power of two, at least 16)
-# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200 plane 1.068 vs SGLang, job h05)
+# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200: 1.068 vs SGLang)
 CBF_TMA32 = {"qkv_gate": (64, 128, 3, 4, 4)}
 CBF_TMA = {
-    "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200 plane 5-6% faster than (32, 128, 2, 4, 5), job h09)
-    "o": (64, 256, 1, 4, 4),          # 2-32 tokens; H200 plane 3-8% faster than the swap-AB streaming tile, job h26
-    "unpooler": (64, 256, 1, 4, 4),   # 9-32 tokens (2-8 take the slice path first); H200 plane 17.0 vs 17.2-17.4 us SGLang, job h15
+    "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200: 5-6% faster than (32, 128, 2, 4, 5))
+    "o": (64, 256, 1, 4, 4),          # 2-32 tokens; on the H200 3-8% faster than the swap-AB streaming tile
+    "unpooler": (64, 256, 1, 4, 4),   # 9-32 tokens (2-8 take the slice path first); H200: 17.0 vs 17.2-17.4 us for SGLang
 }
 
 
@@ -3002,7 +3002,7 @@ CBF_TMA = {
 def _cbf_gemv_rows(X, W, Y, K: tl.constexpr, N: tl.constexpr, SX: tl.constexpr, SW: tl.constexpr,
                    ROWS: tl.constexpr, TILE_K: tl.constexpr):
     """One token on CUDA cores: ROWS weight rows per program, TILE_K columns per step, FP32 accumulation,
-    weights loaded with .cg (the form of aa2862cc's one-token pooler GEMV)."""
+    weights loaded with .cg (the form of the base one-token pooler GEMV)."""
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     columns = tl.arange(0, TILE_K)
     accum = tl.full((ROWS, TILE_K), 0, tl.float32)
@@ -3026,9 +3026,9 @@ def _cbf_launch_gemv(x, w, n, cfg):
 # One-token CUDA-core GEMV: layer -> ROWS, TILE_K, num_warps
 CBF_GEMV1 = {
     "qkv_gate": (1, 4096, 16),  # 2304 programs, one row and one load burst each
-    "pooler": (1, 4096, 16),    # H200 plane 15.5 vs 18.2 us for aa2862cc's (4, 2048, 16) (job h05)
-    "o": (2, 1024, 4),          # H200 plane 4.56 vs SGLang 5.50 us (job h05)
-    "unpooler": (1, 2048, 4),   # the 1024-row slice: 1024 programs (H200 plane 2.84 vs 3.49 us for (2, 4096, 4), job h09)
+    "pooler": (1, 4096, 16),    # H200: 15.5 vs 18.2 us for the base (4, 2048, 16) tiling
+    "o": (2, 1024, 4),          # H200: 4.56 vs SGLang 5.50 us
+    "unpooler": (1, 2048, 4),   # the 1024-row slice: 1024 programs (H200: 2.84 vs 3.49 us for (2, 4096, 4))
 }
 
 
@@ -3082,7 +3082,7 @@ def _cbf_launch_gemv32(x, w, n, state, cfg, out_dtype):
 
 
 # Router at one token: FP32 weights as given, one row per program, 16 warps, no K split
-# (H200: 2.701 against SGLang, job 7c81bace)
+# (H200: 2.701 against SGLang)
 CBF_ROUTER1 = (1, 2048, 1, 16, 1)
 
 
@@ -3146,8 +3146,8 @@ def _cbf_launch_lm(x, w, n, state, cfg):
 # 128 tokens (verify 16), split-K wgmma GEMM: layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, BLOCK_M
 # (programs: 18 x 7 = 126, 32 x 4 = 128, 128 x 1 = 128; sm_90 cross-compile: HGMMA + UTMALDG, 96-131 KB shared)
 CBF_LM128 = {
-    "qkv_gate": (64, 128, 3, 4, 128),  # 36 x 3 = 108 programs (H200 plane 15.2 vs 16.0 us cuBLAS, job h08)
-    "pooler": (64, 128, 2, 4, 128),    # 64 x 2 = 128 programs (H200 plane 22.6 vs 23.3 us for (128, 64, 4, 8), job h08)
+    "qkv_gate": (64, 128, 3, 4, 128),  # 36 x 3 = 108 programs (H200: 15.2 vs 16.0 us for cuBLAS)
+    "pooler": (64, 128, 2, 4, 128),    # 64 x 2 = 128 programs (H200: 22.6 vs 23.3 us for (128, 64, 4, 8))
 }
 
 
@@ -3158,7 +3158,7 @@ CBF_UNPOOL8 = (32, 128, 4, 4, 4)
 @triton.jit
 def _cbf_router_partials(X, HI, LO, PARTIAL, M, K: tl.constexpr, N: tl.constexpr, SXM, SXK,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr):
-    """aa2862cc's router partials kernel generalised over the tiling: BF16 hi and lo products with separate FP32
+    """The base router partials kernel generalised over the tiling: BF16 hi and lo products with separate FP32
     accumulators over one of SPLIT_K K ranges, summed and stored as an FP32 partial."""
     pid_n = tl.program_id(0)
     split = tl.program_id(1)
@@ -3205,23 +3205,23 @@ def _cbf_launch_router(x, n, state, cfg):
 
 
 # Router (BF16 hi/lo, two kernels) by exact token count: BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, BLOCK_M
-# (H200 plane, real SGLang comparator: m16 5.11 vs 6.29 us, m128 6.96 vs 10.28, m256 8.90 vs 10.88 for aa2862cc's
-# tilings; jobs h16-h17; 8 and 32 tokens from job h18d).
+# (H200: m16 5.11 vs 6.29 us, m128 6.96 vs 10.28, m256 8.90 vs 10.88 for the base
+# tilings).
 CBF_ROUTER_HILO = {
-    8: (32, 128, 16, 4, 4, 16),      # job h18d: 5.10 us vs aa2862cc's FP32 CUDA-core kernel ~6.0 us
+    8: (32, 128, 16, 4, 4, 16),      # H200: 5.10 us vs ~6.0 us for an FP32 CUDA-core kernel
     16: (32, 64, 32, 4, 4, 16),
-    32: (64, 64, 16, 4, 5, 16),      # job h18d: 5.79 us vs aa2862cc's tiling ~7.1 us
+    32: (64, 64, 16, 4, 5, 16),      # H200: 5.79 us vs ~7.1 us for the base tiling
     128: (32, 128, 8, 4, 5, 64),
     256: (64, 64, 8, 4, 5, 64),
 }
-# TMA streaming for qkv_gate at 9-16 tokens (H200 plane 11.9 vs 12.4 us for the streaming kernel, job h15)
+# TMA streaming for qkv_gate at 9-16 tokens (H200: 11.9 vs 12.4 us for the streaming kernel)
 CBF_TMA16 = {"qkv_gate": (32, 128, 6, 4, 4)}
 
 
 @triton.jit
 def _cbf_gemv_rows32(X, W, Y, K: tl.constexpr, N: tl.constexpr, SX: tl.constexpr, SW: tl.constexpr,
                      ROWS: tl.constexpr, TILE_K: tl.constexpr):
-    """One token on CUDA cores with FP32 weights and FP32 output (the router), aa2862cc's one-token GEMV form."""
+    """One token on CUDA cores with FP32 weights and FP32 output (the router), the base one-token GEMV form."""
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     columns = tl.arange(0, TILE_K)
     accum = tl.full((ROWS, TILE_K), 0, tl.float32)
@@ -3242,7 +3242,7 @@ def _cbf_launch_router1(x, w, n, cfg):
     return out
 
 
-# Router at one token: ROWS, TILE_K, num_warps (H200 plane 2.65 vs 2.89 us for the 16-warp GEMV, job h26)
+# Router at one token: ROWS, TILE_K, num_warps (H200: 2.65 vs 2.89 us for the 16-warp GEMV)
 CBF_ROUTER1_ROWS = (1, 2048, 32)
 
 
@@ -3284,7 +3284,7 @@ def _cbf_dispatch(x, layer, n, state):
     if cfg is None:
         return None
     return _cbf_launch(x, state[layer][:n], n, state, cfg, max(16, triton.next_power_of_2(m)))
-# ---- end of the c043 block ----
+# ---- end of the muse_bf16_proj block ----
 
 LANEB_DONOR = {('router', 1)}
 
@@ -3292,7 +3292,7 @@ LANEB_DONOR = {('router', 1)}
 @triton.jit
 def _cbf_skinny_gemm_so(x_ptr, w_ptr, out_ptr, part_ptr, cnt_ptr, M, N, K, OUT_STRIDE,
                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr):
-    """c043's _cbf_skinny_gemm (non-atomic path, identical arithmetic) with an output row stride, so the unpooler's
+    """_cbf_skinny_gemm (non-atomic path, identical arithmetic) with an output row stride, so the unpooler's
     1024-row slice at 2-8 tokens lands directly in the zero-padded [T, 8192] rows."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -3334,7 +3334,7 @@ def _cbf_skinny_gemm_so(x_ptr, w_ptr, out_ptr, part_ptr, cnt_ptr, M, N, K, OUT_S
 
 
 def _laneb_prepare(state, weights):
-    """c043's state for its block: the layer weights (the same tensors as state["dense"], no copy) and its scratch."""
+    """State for the muse_bf16_proj block: the layer weights (the same tensors as state["dense"], no copy) and its scratch."""
     dense = state["dense"]
     cbf = {name: dense[name] for name in ("qkv_gate", "o", "pooler", "unpooler")}
     cbf.update(router=state["router"], router_hi_t=state["router_hi_t"], router_lo_t=state["router_lo_t"])
@@ -3343,10 +3343,10 @@ def _laneb_prepare(state, weights):
 
 
 
-# ---- LEVER-T128 step 1 (PREREG-LEVER-T128-step1): pinned cuBLASLt configurations at T=128/256 ----
-# Chosen offline by the S1 sweep (lt_sweep.py) and rebuilt in prepare() from their configuration attributes. A plan is
+# ---- pinned cuBLASLt configurations at T=128/256 ----
+# Chosen offline by a sweep of cuBLASLt algorithms and rebuilt in prepare() from their configuration attributes. A plan is
 # used only if the rebuilt 64-byte algorithm equals the recorded one, cublasLtMatmulAlgoCheck accepts it, and a fixed
-# self-test input reproduces the parent's own call bit for bit; otherwise that shape keeps the parent's call
+# self-test input reproduces the default call bit for bit; otherwise that shape keeps the default call
 # (bitwise-safe) and _LT_OK / _LT_STATUS say so.
 import ctypes as _lt_ct
 import glob as _lt_glob
@@ -3356,8 +3356,8 @@ LT_ENUMS = {'CUBLAS_COMPUTE_32F': 68, 'CUDA_R_32F': 0, 'CUDA_R_16BF': 14, 'CUBLA
 LT_TABLE = {('pooler', 128): {'id': 66, 'tile': 27, 'stages': 35, 'splitk': 1, 'red': 2, 'swz': 0, 'custom': 2, 'inner': 0, 'cluster': 6, 'ws': 0, 'raw': [115964117058, 4294967331, 2, 1688849860263938, 558779540176897, 60129542158, 292058693646, 0]}, ('pooler', 256): {'id': 66, 'tile': 17, 'stages': 35, 'splitk': 1, 'red': 0, 'swz': 0, 'custom': 0, 'inner': 0, 'cluster': 5, 'ws': 0, 'raw': [73014444098, 4294967331, 0, 1407374883553280, 558779540176897, 60129542158, 292058693646, 0]}}
 LT_SHAPES = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096)}
 LT_WS_BYTES = 64 << 20
-_LT_OK = [False]  # every table entry active (read by harnesses, like _B3CL_OK)
-_LT_STATUS = {}  # "layer:T" -> "active" or why that shape keeps the parent's call
+_LT_OK = [False]  # every table entry active (diagnostic flag, like _B3CL_OK)
+_LT_STATUS = {}  # "layer:T" -> "active" or why that shape keeps the default call
 _LT_LAUNCH_FALLBACKS = [0]
 
 
@@ -3398,8 +3398,8 @@ def _lt_ok(st, what):
 
 def _lt_prepare(state, device):
     """The pinned plans, built once from shape and configuration only (no value-dependent choice). A shape whose
-    plan cannot be built, rebuilt byte-equal, checked, or reproduce the parent's raw bits on a fixed self-test input
-    keeps the parent's own call; _LT_OK[0] says whether every table entry is active, _LT_STATUS says why not."""
+    plan cannot be built, rebuilt byte-equal, checked, or reproduce the default call's raw bits on a fixed self-test input
+    keeps the default call; _LT_OK[0] says whether every table entry is active, _LT_STATUS says why not."""
     _LT_OK[0] = False
     _LT_STATUS.clear()
     if not LT_TABLE:
@@ -3414,7 +3414,7 @@ def _lt_prepare(state, device):
         types7 = (E["CUBLAS_COMPUTE_32F"], E["CUDA_R_32F"], bf, bf, bf, bf)
         lt = {"lib": lib, "path": path, "h": h, "plans": plans, "one": _lt_ct.c_float(1.0), "zero": _lt_ct.c_float(0.0),
               "ws": torch.empty(LT_WS_BYTES, dtype=torch.uint8, device=device)}
-    except Exception as exc:  # no cuBLASLt here: every shape keeps the parent's call
+    except Exception as exc:  # no cuBLASLt here: every shape keeps the default call
         for key in LT_TABLE:
             _LT_STATUS["%s:%d" % key] = "library: %s" % str(exc)[:120]
         return
@@ -3449,7 +3449,7 @@ def _lt_prepare(state, device):
             if chk.workspaceSize > LT_WS_BYTES:
                 raise RuntimeError("workspace %d > %d" % (chk.workspaceSize, LT_WS_BYTES))
             plan = (desc, lay, algo, chk.workspaceSize, n)
-            # self-test: the pinned plan must reproduce the parent's own call bit for bit on a fixed input
+            # self-test: the pinned plan must reproduce the default call bit for bit on a fixed input
             g = torch.Generator(device=device).manual_seed(1009 + t)
             x = torch.randn((t, k), generator=g, device=device).to(torch.bfloat16)
             w = state["dense"][layer]
@@ -3470,7 +3470,7 @@ def _lt_prepare(state, device):
 
 
 def _lt_dense(x, layer, state):
-    """The pinned cuBLASLt product for this (layer, T), or None (no active plan: the parent's own call). A launch the
+    """The pinned cuBLASLt product for this (layer, T), or None (no active plan: the default call). A launch the
     library rejects (a host-side status, never a data value) drops the plan and is counted in _LT_LAUNCH_FALLBACKS."""
     lt = state.get("lt")
     plan = lt["plans"].get((layer, x.shape[0])) if lt is not None else None
@@ -3489,11 +3489,11 @@ def _lt_dense(x, layer, state):
         _LT_OK[0] = False
         return None
     return out
-# ---- end of LEVER-T128 step 1 ----
+# ---- end of pinned cuBLASLt block ----
 
 
 def _dense(x, layer, state, out=None, pref=False):
-    """The projection for this layer: c043's kernel at LANEB_DONOR's pairs, else the parent's _gemm (same call)."""
+    """The projection for this layer: the muse_bf16_proj kernels at LANEB_DONOR's pairs, else this layer's _gemm."""
     t = x.shape[0]
     if (layer, t) in LANEB_DONOR and x.is_contiguous():
         cbf = state["cbf"]
@@ -3516,14 +3516,14 @@ def _dense(x, layer, state, out=None, pref=False):
     if layer == "unpooler" and t <= SLICED_UNPOOL_MAX_TOKENS:
         if t == 1:
             return _gemm(x, state["dense"]["unpool_slice"], out=out[:, :UNPOOL_SLICE])
-        if _B3CL_OK[0] and x.is_contiguous():  # B3a P-b: cluster DSMEM split-K into the zero-padded rows
+        if _B3CL_OK[0] and x.is_contiguous():  # cluster DSMEM split-K into the zero-padded rows
             try:
                 return _b3cl_launch(x, state["dense"]["unpooler"][:UNPOOL_SLICE], UNPOOL_SLICE, B3CL_UNPOOL8, 16, out=out)
             except Exception as exc:  # first use happens before capture; torch.mm serves from then on
                 _B3CL_OK[0] = False
                 print("B3a: cluster kernel unavailable (%s: %s)" % (type(exc).__name__, exc))
         return torch.mm(x, state["dense"]["unpooler"][:UNPOOL_SLICE].t(), out=out[:, :UNPOOL_SLICE])
-    if x.shape[0] >= 128:  # LEVER-T128 step 1: the pinned cuBLASLt plan, if this (layer, T) has one
+    if x.shape[0] >= 128:  # the pinned cuBLASLt plan, if this (layer, T) has one
         y = _lt_dense(x, layer, state)
         if y is not None:
             return y
@@ -3531,7 +3531,7 @@ def _dense(x, layer, state, out=None, pref=False):
 
 
 def _router_logits(x, t, state):
-    """The router at LANEB_DONOR's pairs (c043's one-token FP32 GEMV / split-K hi-lo), else None (parent's path)."""
+    """The router at LANEB_DONOR's pairs (one-token FP32 GEMV / split-K hi-lo), else None (this layer's own path)."""
     if ("router", t) not in LANEB_DONOR:
         return None
     cbf = state["cbf"]
@@ -3540,7 +3540,7 @@ def _router_logits(x, t, state):
     return _cbf_launch_router(x, cbf["router"].shape[0], cbf, CBF_ROUTER_HILO[t])
 
 
-# ---- B3a (claude-bf16): cluster DSMEM split-K for small-m dense (bf16_proj c046/c048 kernel, output row stride) ----
+# ---- cluster DSMEM split-K for small-m dense (the muse_bf16_proj cluster kernel, with an output row stride) ----
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor as _B3CL_TD
 except Exception:  # older Triton
@@ -3654,13 +3654,13 @@ def _b3cl_launch(x, w, n, cfg, block_m, out=None):
     ck.run(grid[0], grid[1], grid[2], stream, ck.function, pm, ck.launch_metadata(grid, stream, *args),
            knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
     return out
-# ---- end of B3a cluster block ----
+# ---- end of cluster DSMEM block ----
 
 
-# ---- lane B (B002): the layer boundaries on SGLang's DSMEM cluster kernel at SM90 ----
+# ---- the layer boundaries on SGLang's DSMEM cluster kernel at SM90 ----
 # SGLang's fused_norm_residual picks its multi-CTA cluster kernel (one row split over C CTAs, partial RMS moments
 # exchanged through distributed shared memory) only at capability >= 10, and the one-CTA-per-row kernel otherwise.
-# Both are SGLang's kernels; on the H200 the cluster kernel is faster at small token counts (lane B hb004b). Cluster
+# Both are SGLang's kernels; on the H200 the cluster kernel is faster at small token counts. Cluster
 # size by token count (fixed-shape branch); absent counts keep the module's own call.
 from sglang.kernels.ops.muse_spark_v12.norm_residual import fused_norm_residual as _fused_norm_residual
 BOUNDARY_CLUSTER = {"attn": {8: 16, 16: 16, 32: 16}, "ffn": {8: 16, 16: 16, 32: 16}}
@@ -3762,7 +3762,7 @@ def prepare(weights):
         "bank": _marlin_bank(weights),
         # Hopper only: on a bandwidth-bound GPU (L40S) Marlin is at par or better at these sizes; on SM90
         # Marlin's padded 48/64-row blocks are the target (decided by device capability, not data).
-        "grouped_moe": False,  # c013: SGLang's Marlin (block capped) on every device
+        "grouped_moe": False,  # SGLang's Marlin (block capped) on every device
         "unpool_rows": torch.zeros((SLICED_UNPOOL_MAX_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device),
         "raw_experts": {name: weights[name].contiguous() for name in ("w13", "w13_sf", "w13_gs", "w2", "w2_sf", "w2_gs")},
         "side_stream": torch.cuda.Stream(device),
@@ -3772,25 +3772,25 @@ def prepare(weights):
     del freqs
     for op in (state["attn_boundary"], state["ffn_boundary"]):
         op._ensure_cached_weights(torch.bfloat16)
-    state["grouped"] = _grouped_prepare(weights)  # c030
-    state["cbf"] = _laneb_prepare(state, weights)  # lane B
-    state["d1_buf"] = torch.full((1 + TOP_K,), -1, dtype=torch.int32, device=device)  # c042 part B
-    # P8: split-K partials (up to 16 splits) and per-tile arrival counters (each last arriver resets its own)
+    state["grouped"] = _grouped_prepare(weights)  # grouped NVFP4 expert weights
+    state["cbf"] = _laneb_prepare(state, weights)  # muse_bf16_proj block state
+    state["d1_buf"] = torch.full((1 + TOP_K,), -1, dtype=torch.int32, device=device)  # one-token expert slot buffer
+    # split-K partials (up to 16 splits) and per-tile arrival counters (each last arriver resets its own)
     state["d1s_part13"] = torch.empty(TOP_K * (D_EXPERT // BN) * 16 * 2 * BN, dtype=torch.float32, device=device)
     state["d1s_part2"] = torch.empty(TOP_K * (D_EXPERT // BN) * 16 * BN, dtype=torch.float32, device=device)
     state["d1s_cnt13"] = torch.zeros(TOP_K * (D_EXPERT // BN), dtype=torch.int32, device=device)
     state["d1s_cnt2"] = torch.zeros(TOP_K * (D_EXPERT // BN), dtype=torch.int32, device=device)
     state["iota8"] = torch.arange(TOP_K, dtype=torch.int32, device=device)
-    _lt_prepare(state, device)  # LEVER-T128 step 1
+    _lt_prepare(state, device)  # pinned cuBLASLt plans
     torch.cuda.synchronize()
     return state
 
 
-# ---- c027: one-token NVFP4 expert GEMV (decode-1). Marlin runs its 8-row MMA tiles at ~60% of read bandwidth at
-# one token (D012); these two kernels read each routed expert's packed weights and scales once per slot and are
+# ---- one-token NVFP4 expert GEMV (decode-1). Marlin runs its 8-row MMA tiles at ~60% of read bandwidth at
+# one token; these two kernels read each routed expert's packed weights and scales once per slot and are
 # bandwidth-bound. Same arithmetic contract as Marlin + silu_and_mul: exact E2M1 x E4M3 dequant to BF16, FP32
 # accumulation, the expert's global scale in FP32, gate/up rounded to BF16 before silu(g) * u, BF16 out.
-GEMV_MOE_MAX_TOKENS = 0  # c031: off (lost 5-7% at decode-1 on the H200, job 128bc1683e6f48fb)
+GEMV_MOE_MAX_TOKENS = 0  # off (lost 5-7% at decode-1 on the H200)
 
 
 @triton.jit
@@ -3873,7 +3873,7 @@ def _moe_gemv(x, local_ids, raw, bn1=8, bk1=512, bn2=8, bk2=512, w1=4, w2=4):
     return y.view(T, TOP_K, H)
 
 
-# ---- c028: at one token the pre-expert RMSNorm and local-id mapping run inside the gate/up GEMV (one dependent
+# ---- at one token the pre-expert RMSNorm and local-id mapping run inside the gate/up GEMV (one dependent
 # kernel fewer on the critical chain; Marlin's block alignment is not needed by the GEMV).
 @triton.jit
 def _moe_gemv_norm_gate_up_kernel(X, NW, eps, TOPK_IDS, LS, LOCAL, W, SF, GS, OUT,
@@ -3919,7 +3919,7 @@ def _moe_gemv_norm_gate_up_kernel(X, NW, eps, TOPK_IDS, LS, LOCAL, W, SF, GS, OU
 
 
 def _experts_one_token(x, norm_w, eps, topk_ids, local_start, topk_weights, state, bn=8, bk=512, warps=4):
-    """Pre-expert norm + local ids + expert GEMVs + post-expert finalize for one token (c028)."""
+    """Pre-expert norm + local ids + expert GEMVs + post-expert finalize for one token."""
     raw = state["raw_experts"]
     T, K = x.shape
     w13, s13, w2_, s2 = raw["w13"], raw["w13_sf"], raw["w2"], raw["w2_sf"]
@@ -3941,18 +3941,18 @@ def _experts_one_token(x, norm_w, eps, topk_ids, local_start, topk_weights, stat
                                      state["post_expert_w"], local)
 
 
-# ---- c030: claude-moe c157 grouped NVFP4 expert kernels (verbatim; _route takes local_start by pointer) ----
+# ---- grouped NVFP4 expert kernels (_route takes local_start by pointer) ----
 SCALE_BIAS = gl.constexpr(2.0 ** 119)
 ACC_BIAS = gl.constexpr(2.0 ** 7)
 BM = 16
 D1_KS = (16, 8)
-W2OV_MODE = 2  # moe-w2ov: d1 W2 K-loop schedule (1 = A1 staging hoist, 2 = A2 two decodes first), fixed constant  # P8: K splits of the direct one-token W13 / W2 (m021)
+W2OV_MODE = 2  # one-token W2 K-loop schedule (1 = activation staging hoisted, 2 = also two decodes first), fixed constant; D1_KS: K splits of the direct one-token W13 / W2
 BN = 64
 BK = 256
 NUM_WARPS = 4
 XS_MIN_M = 1
 PF_MAX_M = 1  # weight prefetch (register double buffer) at decode 1 only
-SMB_MIN_M = 4096  # c040: shared-B (wgmma) path off - the register path is faster on this layer's routing (h021)
+SMB_MIN_M = 4096  # shared-B (wgmma) path off: the register path is faster on this layer's routing
 
 
 @triton.jit
@@ -3961,7 +3961,7 @@ def _route(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, P, LS_PTR,
     offs = tl.arange(0, P_BLOCK)
     pm = offs < P
     gid = tl.load(ids_ptr + offs, mask=pm, other=-1)
-    lid = gid - tl.load(LS_PTR)  # c030: this layer passes local_start as an int32 [1] tensor
+    lid = gid - tl.load(LS_PTR)  # this layer passes local_start as an int32 [1] tensor
     live = pm & (lid >= 0) & (lid < LOCAL)
     lid = tl.where(live, lid, -1)
     tl.store(local_ptr + offs, lid, mask=pm)
@@ -4060,7 +4060,7 @@ LW16 = gl.constexpr(gl.DistributedLinearLayout(
                [0, 0, 1, 0, 0, 0], [0, 0, 2, 0, 0, 0], [0, 0, 4, 0, 0, 0]],
     lane_bases=[[0, 1, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0], [4, 0, 0, 0, 0, 0]],
     warp_bases=[[16, 0, 0, 0, 0, 0], [32, 0, 0, 0, 0, 0]], block_bases=[], shape=[64, 4, 8, 2, 2, 2]))
-# The same decode for one K chunk of 64 (c152): words [BN, 4 (q), 2 (word)], so a chunk's decoded A operand is 16
+# The same decode for one K chunk of 64: words [BN, 4 (q), 2 (word)], so a chunk's decoded A operand is 16
 # registers per thread instead of 64.
 LW16C = gl.constexpr(gl.DistributedLinearLayout(
     reg_bases=[[0, 0, 0, 1, 0, 0], [8, 0, 0, 0, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1], [0, 0, 1, 0, 0, 0]],
@@ -4101,7 +4101,7 @@ LX2_32 = gl.constexpr(gl.DistributedLinearLayout(
 LXG = gl.constexpr(gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[4, 8], warps_per_cta=[4, 1], order=[1, 0]))
 # ... and the shared buffer, 16-byte chunks XOR-swizzled by row so a quarter warp's rows hit distinct banks.
 X_SMEM = gl.constexpr(gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=8, order=[1, 0]))
-# Shared-B mode (c150): each K block of activations is stored once as [BM, BK] in the MMA's logical K order, 128-byte
+# Shared-B mode: each K block of activations is stored once as [BM, BK] in the MMA's logical K order, 128-byte
 # swizzled. On sm_90 (H200) the GEMMs read it with wgmma, the decoded weights being wgmma's register A operand (the
 # k_width-2 operand layout below is the same register fragment); elsewhere mma_v2 reads it.
 XB_SMEM = gl.constexpr(gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2))
@@ -4207,8 +4207,8 @@ def _x_shared(x_ptr, off, msk, k0, x_s, BM: gl.constexpr, BK: gl.constexpr):
 @gluon.jit
 def _x_shared_n(x_ptr, off, msk, k0, x_s, BM: gl.constexpr, BK: gl.constexpr, nw_ptr, rstd, K: gl.constexpr,
                 dbg_ptr, DBG: gl.constexpr, dbg_on):
-    """claude-bf16 A1: _x_shared on the RAW pooler row: stages bf16((x * rstd) * w) exactly as the norm kernel's
-    output (x and w extended from bf16, one rounding); rows outside the item stay +0.0, as the parent's masked load."""
+    """_x_shared on the RAW pooler row: stages bf16((x * rstd) * w) exactly as the norm kernel's
+    output (x and w extended from bf16, one rounding); rows outside the item stay +0.0, as the unfused path's masked load."""
     xg = gl.load(x_ptr + off + k0, mask=msk, other=0.0)
     wv = gl.load(nw_ptr + (off % K) + k0)
     xn = ((xg.to(gl.float32) * rstd) * wv.to(gl.float32)).to(gl.bfloat16)
@@ -4255,8 +4255,8 @@ def _w13_silu(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out
               DIRECT: gl.constexpr = False, NLOC: gl.constexpr = 32, IL: gl.constexpr = False):
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    tl.extra.cuda.gdc_launch_dependents()  # b1.5 TS: trigger at kernel start (dependents keep their gdc_wait)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    tl.extra.cuda.gdc_launch_dependents()  # trigger at kernel start (dependents keep their gdc_wait)
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     if DIRECT:  # M = 1: slot pid_w of the only token is one item of one row; no routing pass
@@ -4275,8 +4275,8 @@ def _w13_silu(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
-        BLKW: gl.constexpr = BN * 36 if IL else BN * 32  # IL (P1): codes then scales per 9216 B block
+        KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
+        BLKW: gl.constexpr = BN * 36 if IL else BN * 32  # IL: codes then scales per 9216 B block
         BLKB: gl.constexpr = BN * 144 if IL else BN * 16
         S0: gl.constexpr = BN * 128 if IL else 0
         w_off = (e * (2 * I // BN) + pid_n) * KB * BLKW + rw * 32 + qw * 8 + jw
@@ -4372,8 +4372,8 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         IL: gl.constexpr = False, KS: gl.constexpr = 1):
     mma: gl.constexpr = (MMA3_8 if BM == 8 else MMA3_16) if HOP else MMA_L
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    tl.extra.cuda.gdc_launch_dependents()  # b1.5 TS: trigger at kernel start (dependents keep their gdc_wait)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    tl.extra.cuda.gdc_launch_dependents()  # trigger at kernel start (dependents keep their gdc_wait)
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     if DIRECT:  # M = 1: slot pid_w of the only token is one item of one row; no routing pass
@@ -4393,7 +4393,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights
+        KB: gl.constexpr = K // BK  # tile-major weights
         BLKW: gl.constexpr = BN * 36 if IL else BN * 32
         BLKB: gl.constexpr = BN * 144 if IL else BN * 16
         S0: gl.constexpr = BN * 128 if IL else 0
@@ -4413,7 +4413,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         if PF:
             wq_n = gl.load(wp + w_off)
             sq_n = gl.load(sf_ptr + s_off)
-        if KS > 1:  # lane B B044 (P19): this CTA's K range
+        if KS > 1:  # this CTA's K range
             k_lo = gl.program_id(2) * (K // KS)
         else:
             k_lo = 0
@@ -4451,7 +4451,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         m_o = gl.arange(0, BM, layout=gl.SliceLayout(0, mma))
         ro = r0 + m_o
         pair_o = gl.load(sorted_ptr + ro, mask=ro < r1, other=0)
-        if GU:  # c186: rows 16 s + i are gate column 8 s + i of this tile's 32, rows 16 s + 8 + i its up rows
+        if GU:  # rows 16 s + i are gate column 8 s + i of this tile's 32, rows 16 s + 8 + i its up rows
             rows2 = gl.expand_dims(n_o, 1) + gl.expand_dims(m_o * 0, 0)
             pair2 = gl.expand_dims(pair_o, 0) + gl.expand_dims(n_o * 0, 1)
             msk2 = gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1)
@@ -4464,7 +4464,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
             v = (hg / (1.0 + gl.exp(-hg))).to(gl.bfloat16).to(gl.float32) * hu
             col = pid_n * (BN // 2) + (rg // 16) * 8 + rg % 8
             gl.store(out_ptr + pg * (N // 2) + col, v.to(gl.bfloat16), mask=mg != 0)
-        elif KS > 1:  # lane B B044 (P19): FP32 partial row [pair, split, N]
+        elif KS > 1:  # FP32 partial row [pair, split, N]
             optr = out_ptr + gl.expand_dims(pair_o, 0) * (KS * N) + gl.program_id(2) * N + gl.expand_dims(n0 + n_o, 1)
             gl.store(optr, y, mask=gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1))
         else:
@@ -4501,7 +4501,7 @@ def _permute_bits(packed):
 
 
 def _tile_major(codes, sf):
-    """c175: codes uint8 [L, rows, K/2] and fp8 scales [L, rows, K/16] -> the same bytes ordered tile-major, so that
+    """Codes uint8 [L, rows, K/2] and fp8 scales [L, rows, K/16] -> the same bytes ordered tile-major, so that
     each (expert, BN-row tile, BK block) is one contiguous BN x 128 B run of codes and one BN x 16 B run of scales
     (a lossless permutation of bytes; contiguous blocks stream from DRAM better than BN rows 2 KB apart)."""
     n_l, rows, half_k = codes.shape
@@ -4511,13 +4511,13 @@ def _tile_major(codes, sf):
     return c, s
 
 
-IL_MIN_M = 1 << 30  # lane B B035c: IL only at T = 8 (IL lost at 128 / 256 on decode, hb068 / hb070); / moe c187 P1: interleaved code+scale blocks from this many tokens ...
-IL_M = (8, 16)  # ... and at these token counts; lane B B048 (P25 = research-g1 P-IL16): W2 interleaved at T = 16 (W13 runs GU there)
-GU_M = (8, 16, 32)  # P35 (swarm F-0842Z): GU also at T=8; moe c187 P5g: token counts whose W13 uses the gate/up-paired copy (decode: 16 / 32 only)
+IL_MIN_M = 1 << 30  # IL (interleaved code+scale blocks) only at T = 8 (IL was slower at 128 / 256 tokens on this layer); from this many tokens ...
+IL_M = (8, 16)  # ... and at these token counts; at T = 16 only W2 reads the interleaved copy (W13 runs GU there)
+GU_M = (8, 16, 32)  # token counts whose W13 uses the gate/up-paired (GU) copy
 
 
 def _gu_rows(I):
-    """c186: row order of the gate/up-paired W13 copy. New row 64 t + 16 s + 8 g + i holds gate (g = 0) or up (g = 1)
+    """Row order of the gate/up-paired W13 copy. New row 64 t + 16 s + 8 g + i holds gate (g = 0) or up (g = 1)
     row of output column 32 t + 8 s + i (a lossless row permutation)."""
     r = torch.arange(2 * I)
     t, s, g, i = r // 64, (r % 64) // 16, (r % 16) // 8, r % 8
@@ -4525,28 +4525,28 @@ def _gu_rows(I):
 
 
 def _interleaved(c, s):
-    """P1 (c183): tile-major codes and scales merged per block (codes then scales, 9216 B), a second lossless copy
+    """Tile-major codes and scales merged per block (codes then scales, 9216 B), a second lossless copy
     used from IL_MIN_M tokens and at IL_M, where it streams better."""
     n_l, nt, kb = c.shape[:3]
     blk = torch.cat([c.reshape(n_l, nt, kb, -1), s.view(torch.uint8).reshape(n_l, nt, kb, -1)], dim=3).contiguous()
     return blk, blk.view(torch.float8_e4m3fn)
 
 
-# ---- lane B B043: P20 (moe-b P8a 2c7901d7) W13 verify kernels, verbatim ----
-MIX_MIN_M = 128  # lane B B043 (P20 = moe-b P8a): from this many tokens W13 runs _w13_mix on 32-row items
+# ---- W13 verify kernels: items of up to 32 rows, token tile chosen per item ----
+MIX_MIN_M = 128  # from this many tokens W13 runs _w13_mix on 32-row items
 BM_W13 = 32
-W13_MAXNREG_MIX = 128  # P8a: the 32-row tile needs 128 registers to run without spills
+W13_MAXNREG_MIX = 128  # the 32-row tile needs 128 registers to run without spills
 
 
 @triton.jit
 def _route2(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, nwork2_ptr, P, local_start,
             LOCAL: tl.constexpr, BM: tl.constexpr, BM2: tl.constexpr, P_BLOCK: tl.constexpr, W_MAX: tl.constexpr,
             W_MAX2: tl.constexpr):
-    """_route, plus a second work list over the same sorted pairs with items of at most BM2 rows (P8a: W13's)."""
+    """_route, plus a second work list over the same sorted pairs with items of at most BM2 rows (W13's)."""
     offs = tl.arange(0, P_BLOCK)
     pm = offs < P
     gid = tl.load(ids_ptr + offs, mask=pm, other=-1)
-    lid = gid - tl.load(local_start)  # lane B B043: this layer passes local_start as an int32 [1] tensor
+    lid = gid - tl.load(local_start)  # this layer passes local_start as an int32 [1] tensor
     live = pm & (lid >= 0) & (lid < LOCAL)
     lid = tl.where(live, lid, -1)
     tl.store(local_ptr + offs, lid, mask=pm)
@@ -4593,7 +4593,7 @@ def _route2(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, nwor
 
 
 
-# ---- moe-b MC1: _route2 on LOCAL + 2 CTAs. The parent's sort of keys lid * P_BLOCK + offs (unique; local pairs by
+# ---- _route2 on LOCAL + 2 CTAs. The single-CTA sort of keys lid * P_BLOCK + offs (unique; local pairs by
 # expert then pair index, non-local pairs after in pair order) is reproduced exactly: CTA e < LOCAL writes expert e's
 # pairs at starts[e] + their rank in pair order, CTA LOCAL writes the non-local pairs after the n_live local ones, and
 # CTA LOCAL + 1 writes local and both work lists with _route2's own expressions. Integer outputs are bit-identical.
@@ -4609,7 +4609,7 @@ def _route2_mc(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, n
     live = pm & (lid >= 0) & (lid < LOCAL)
     lid = tl.where(live, lid, -1)
     if pid < LOCAL:
-        start = tl.sum((live & (lid < pid)).to(tl.int32), 0)  # moe-b MC2: no histogram for one offset
+        start = tl.sum((live & (lid < pid)).to(tl.int32), 0)  # no histogram for one offset
         mine = live & (lid == pid)
         rank = tl.cumsum(mine.to(tl.int32), 0) - 1
         tl.store(sorted_ptr + start + rank, offs, mask=mine)
@@ -4618,7 +4618,7 @@ def _route2_mc(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, n
         n_live = tl.sum(live.to(tl.int32), 0)
         rank = tl.cumsum(dead.to(tl.int32), 0) - 1
         tl.store(sorted_ptr + n_live + rank, offs, mask=dead)
-    elif pid == LOCAL + 1:  # moe-b MC2: local ids + W2's work list
+    elif pid == LOCAL + 1:  # local ids + W2's work list
         tl.store(local_ptr + offs, lid, mask=pm)
         counts = tl.histogram(tl.maximum(lid, 0), LOCAL, mask=live)
         starts = tl.cumsum(counts, 0) - counts
@@ -4639,7 +4639,7 @@ def _route2_mc(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, n
         tl.store(work_ptr + w * 3 + 1, r0, mask=wm)
         tl.store(work_ptr + w * 3 + 2, r1, mask=wm)
         tl.store(nwork_ptr, total)
-    else:  # moe-b MC2: W13's work list on its own CTA
+    else:  # W13's work list on its own CTA
         counts = tl.histogram(tl.maximum(lid, 0), LOCAL, mask=live)
         starts = tl.cumsum(counts, 0) - counts
         e_ar = tl.arange(0, LOCAL)
@@ -4668,7 +4668,7 @@ def _w13_item(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     n0 = pid_n * BN
     rw, qw, jw = _idx3(BN, 4, 8, L3)
-    KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
+    KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
     w_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
     rs, qs, gs_ = _idx3(BN, 4, 4, LS)
     s_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -4753,8 +4753,8 @@ def _w13_mix(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_
              K: gl.constexpr, I: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
              XS: gl.constexpr, SMB: gl.constexpr = False, HOP: gl.constexpr = False,
              CHK: gl.constexpr = False, PF: gl.constexpr = False):
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    tl.extra.cuda.gdc_launch_dependents()  # b1.5 TS: trigger at kernel start (dependents keep their gdc_wait)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    tl.extra.cuda.gdc_launch_dependents()  # trigger at kernel start (dependents keep their gdc_wait)
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     active = pid_w < gl.load(nwork_ptr)
@@ -4779,7 +4779,7 @@ def _w13_mix(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_
 
 
 
-# ---- lane B B049: P21 (moe-b P8 e03442b7) W2 per-item tile at M >= MIX_MIN_M, verbatim ----
+# ---- W2 per-item tile at M >= MIX_MIN_M ----
 @gluon.jit
 def _w2_item(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_n,
              K: gl.constexpr, N: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
@@ -4788,7 +4788,7 @@ def _w2_item(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_n
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     n0 = pid_n * BN
     rw, qw, jw = _idx3(BN, 4, 8, L3)
-    KB: gl.constexpr = K // BK  # c175: tile-major weights
+    KB: gl.constexpr = K // BK  # tile-major weights
     w_off = (e * (N // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
     rs, qs, gs_ = _idx3(BN, 4, 4, LS)
     s_off = (e * (N // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -4849,8 +4849,8 @@ def _w2_mix(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
             K: gl.constexpr, N: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr, XS: gl.constexpr,
             SMB: gl.constexpr = False, HOP: gl.constexpr = False,
             CHK: gl.constexpr = False, PF: gl.constexpr = False):
-    tl.extra.cuda.gdc_wait()  # E-3 variant S: wait for the producer's writes before any dependent read (launch_pdl=True launch)
-    tl.extra.cuda.gdc_launch_dependents()  # b1.5 TS: trigger at kernel start (dependents keep their gdc_wait)
+    tl.extra.cuda.gdc_wait()  # wait for the producer's writes before any dependent read (launch_pdl=True launch)
+    tl.extra.cuda.gdc_launch_dependents()  # trigger at kernel start (dependents keep their gdc_wait)
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
     active = pid_w < gl.load(nwork_ptr)
@@ -4870,29 +4870,29 @@ def _w2_mix(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_p
 
 
 def _grouped_prepare(weights):
-    """claude-moe c157 _triton_prepare for this layer's 32 local experts (weights are already local here)."""
+    """Grouped-expert prepare step for this layer's 32 local experts (weights are already local here)."""
     L = LOCAL_EXPERTS
-    # c043: moe c175's tile-major layout (only this grouped copy; the Marlin bank and raw_experts keep theirs)
+    # tile-major layout (only this grouped copy; the Marlin bank and raw_experts keep theirs)
     w13, w13_sf = _tile_major(torch.stack([_permute_bits(weights["w13"][e]) for e in range(L)]), weights["w13_sf"][:L])
     w2, w2_sf = _tile_major(torch.stack([_permute_bits(weights["w2"][e]) for e in range(L)]), weights["w2_sf"][:L])
-    gu = _gu_rows(weights["w13"].shape[1] // 2).to(weights["w13"].device)  # lane B B035 (P17b)
+    gu = _gu_rows(weights["w13"].shape[1] // 2).to(weights["w13"].device)  # gate/up-paired row order
     w13g, w13g_sf = _tile_major(torch.stack([_permute_bits(weights["w13"][e][gu]) for e in range(L)]),
                                 weights["w13_sf"][:L][:, gu])
-    return _segf_chain({  # segment F (F1)
+    return _segf_chain({  # per-(expert, tile) contiguous k-block records
         "w13": w13, "w13_sf": w13_sf, "w13_gs": weights["w13_gs"][:L].float().contiguous(),
         "w2": w2, "w2_sf": w2_sf, "w2_gs": weights["w2_gs"][:L].float().contiguous(),
         "w13g": w13g, "w13g_sf": w13g_sf,
-        "il13": _interleaved(w13, w13_sf), "il2": _interleaved(w2, w2_sf),  # lane B B035 (P17a)
+        "il13": _interleaved(w13, w13_sf), "il2": _interleaved(w2, w2_sf),  # interleaved code+scale copies
         "hopper": torch.cuda.get_device_capability()[0] == 9,
     })
 
 
-SEGF_F1 = True  # segment F (constraint-ctl): d1 W13 reads f1, d1 W2 reads f2 (== il2)
+SEGF_F1 = True  # one-token W13 reads f1, one-token W2 reads f2 (== il2)
 
 
 def _segf_chain(g):
-    # F-B fallback (inbox-267, STACK-RULES-AUDIT da8052d1): a failed inverse check keeps the parent layout and routes the
-    # d1 kernels to the parent addressing (IL=False), so outputs and the normal path are unchanged. _segf_layouts raises
+    # Fallback: a failed inverse check keeps the original layout and routes the
+    # one-token kernels to the original addressing (IL=False), so outputs and the normal path are unchanged. _segf_layouts raises
     # before g is touched, so nothing partial is left behind. Decided once at prepare time (untimed), not per call.
     try:
         g.update(_segf_layouts(g))
@@ -4904,12 +4904,12 @@ def _segf_chain(g):
 
 
 def _segf_layouts(g):
-    """segment F (constraint-ctl) prepare-time expert layouts for the d1/v1 chain. Exact byte permutations of the
+    """Prepare-time expert layouts for the one-token and verify chain. Exact byte permutations of the
     tile-major copies, inverse-checked here (prepare is untimed). Every record is a multiple of 128 B and every
     (expert, tile) run is contiguous:
       f1   uint8 [L, I/BN, KB, 2*BN*(BK/2+BK/16)]  per (expert, W13 n-tile): k-block records
            [gate codes BN*BK/2 | up codes BN*BK/2 | gate sf BN*BK/16 | up sf BN*BK/16]  (18432 B at BN 64, BK 256)
-      f1gu uint8 [L, 2I/BN, KB, BN*(BK/2+BK/16)]   gate/up-paired (GU, _gu_rows) copy: records [codes | sf]   (v1)
+      f1gu uint8 [L, 2I/BN, KB, BN*(BK/2+BK/16)]   gate/up-paired (GU, _gu_rows) copy: records [codes | sf]   (verify)
       f2   uint8 [L, H/BN, KB, BN*(BK/2+BK/16)]    W2 records [codes | sf]   (== il2)
       f3   fp32  [L, 2]                            (w13_gs, w2_gs) per expert
     Each array also comes as (bytes, float8 view) for the kernels' code / scale pointers."""
@@ -4944,7 +4944,7 @@ def _segf_layouts(g):
 
 
 def _grouped_route(topk_ids, local_start):
-    """claude-moe c157's routing step (pairs grouped by local expert, work list); depends only on topk_ids, so c031
+    """The grouped routing step (pairs grouped by local expert, work list); depends only on topk_ids, so this layer
     runs it on the router side stream."""
     M = topk_ids.shape[0]
     L = LOCAL_EXPERTS
@@ -4958,11 +4958,11 @@ def _grouped_route(topk_ids, local_start):
     sorted_pairs = torch.empty((P,), dtype=torch.int32, device=dev)
     work = torch.empty((w_max, 3), dtype=torch.int32, device=dev)
     nwork = torch.empty((1,), dtype=torch.int32, device=dev)
-    if M >= MIX_MIN_M:  # lane B B043 (P20): one routing pass, two work lists (W2's, W13's 32-row items)
+    if M >= MIX_MIN_M:  # one routing pass, two work lists (W2's, W13's 32-row items)
         w_max13 = triton.next_power_of_2(triton.cdiv(P, BM_W13) + L)
         work13 = torch.empty((w_max13, 3), dtype=torch.int32, device=dev)
         nwork13 = torch.empty((1,), dtype=torch.int32, device=dev)
-        _route2_mc[(L + 3,)](ids, local, sorted_pairs, work, nwork, work13, nwork13, P, local_start, LOCAL=L, BM=bm,  # moe-b MC1 / MC2
+        _route2_mc[(L + 3,)](ids, local, sorted_pairs, work, nwork, work13, nwork13, P, local_start, LOCAL=L, BM=bm,  # multi-CTA routing (_route2_mc)
                       BM2=BM_W13, P_BLOCK=p_block, W_MAX=w_max, W_MAX2=w_max13, num_warps=16 if p_block >= 1024 else 4)
         return local, sorted_pairs, work, nwork, bm, w_max, work13, nwork13, w_max13
     _route[(1,)](ids, local, sorted_pairs, work, nwork, P, local_start, LOCAL=L, BM=bm, P_BLOCK=p_block, W_MAX=w_max,
@@ -4970,22 +4970,22 @@ def _grouped_route(topk_ids, local_start):
     return local, sorted_pairs, work, nwork, bm, w_max
 
 
-W13_MAXNREG_MIN_M = 128  # lane B B005: W13 register cap from this many tokens on decode's register path (hb011)
+W13_MAXNREG_MIN_M = 128  # W13 register cap from this many tokens on decode's register path
 W13_MAXNREG = 96
 
 
 def _w13_regcap(M):
-    if M >= MIX_MIN_M:  # lane B B043 (P20): _w13_mix's 32-row tile
+    if M >= MIX_MIN_M:  # _w13_mix's 32-row tile
         return {"maxnreg": W13_MAXNREG_MIX}
     return {"maxnreg": W13_MAXNREG} if M >= W13_MAXNREG_MIN_M else {}
 
 
-W2_KS = 2  # lane B B044 (P19): W2 split-K factor ...
+W2_KS = 2  # W2 split-K factor ...
 W2_KS_M = (8, 16, 32)  # ... at these token counts
 
 
 def _grouped_experts(x, topk_weights, route, state):
-    """claude-moe c157 _triton_kernel_fn (gate/up + silu, down) after _grouped_route, with this file's finalize."""
+    """Grouped expert GEMMs (gate/up + silu, down) after _grouped_route, with this file's finalize."""
     g = state["grouped"]
     M, H = x.shape
     I = D_EXPERT
@@ -4994,14 +4994,14 @@ def _grouped_experts(x, topk_weights, route, state):
     tw = topk_weights.to(torch.float32).contiguous()
     local, sorted_pairs, work, nwork, bm, w_max = route[:6]
     inter = torch.empty((P, I), dtype=torch.bfloat16, device=dev)
-    il = M >= IL_MIN_M or M in IL_M  # lane B B035 (P17a): interleaved code+scale blocks
+    il = M >= IL_MIN_M or M in IL_M  # interleaved code+scale blocks
     w13c, w13s = g["il13"] if il else (g["w13"], g["w13_sf"])
     w2c, w2s = g["il2"] if il else (g["w2"], g["w2_sf"])
-    if M in GU_M:  # lane B B035 (P17b): gate/up-paired W13 through _w2 (GU), SiLU fused
+    if M in GU_M:  # gate/up-paired W13 through _w2 (GU), SiLU fused
         _w2[(2 * I // BN, w_max)](x, g["w13g"], g["w13g_sf"], g["w13_gs"], sorted_pairs, work, nwork,
                                   inter, K=H, N=2 * I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
                                   CHK=True, PF=M <= PF_MAX_M, GU=True, launch_pdl=M != 16, num_warps=NUM_WARPS)
-    elif M >= MIX_MIN_M:  # lane B B043 (P20): W13 on 32-row items, register path
+    elif M >= MIX_MIN_M:  # W13 on 32-row items, register path
         work13, nwork13, w_max13 = route[6:9]
         _w13_mix[(I // BN, w_max13)](x, g["w13"], g["w13_sf"], g["w13_gs"], sorted_pairs, work13, nwork13, inter,
                                      K=H, I=I, BN=BN, BK=BK, BM=BM_W13, XS=M >= XS_MIN_M, SMB=False, HOP=False,
@@ -5012,12 +5012,12 @@ def _grouped_experts(x, topk_weights, route, state):
                                     HOP=g["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
                                     IL=il, launch_pdl=M != 16, num_warps=NUM_WARPS, **_w13_regcap(M))
     y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
-    if M >= MIX_MIN_M:  # lane B B049 (P21 = moe-b P8's W2 half): per-item 8 / 16-row tile, register path
+    if M >= MIX_MIN_M:  # per-item 8 / 16-row tile, register path
         _w2_mix[(H // BN, w_max)](inter, g["w2"], g["w2_sf"], g["w2_gs"], sorted_pairs, work, nwork, y,
                                   K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
                                   CHK=True, PF=M <= PF_MAX_M, launch_pdl=M != 16, num_warps=NUM_WARPS)
         return _post_expert_weighted_sum(y.view(M, TOP_K, H), tw, state["post_expert_w"], local)
-    if M in W2_KS_M:  # lane B B044 (P19): W2 split over K, FP32 partials summed in the post-expert kernel
+    if M in W2_KS_M:  # W2 split over K, FP32 partials summed in the post-expert kernel
         y = torch.empty((P, W2_KS, H), dtype=torch.float32, device=dev)
         _w2[(H // BN, w_max, W2_KS)](inter, w2c, w2s, g["w2_gs"], sorted_pairs, work, nwork, y,
                                      K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
@@ -5039,7 +5039,7 @@ def _experts(x, topk_weights, local_ids, state, align=None):
     size_n = bank["size_n"]
     gemm1_n = 2 * size_n
     topk_weights = topk_weights.to(torch.float32).contiguous()
-    if num_tokens <= GEMV_MOE_MAX_TOKENS:  # c027: bandwidth-bound one-token expert GEMV (fixed-shape branch)
+    if num_tokens <= GEMV_MOE_MAX_TOKENS:  # bandwidth-bound one-token expert GEMV (fixed-shape branch)
         y = _moe_gemv(x, local_ids, state["raw_experts"])
         return _post_expert_weighted_sum(y, topk_weights, state["post_expert_w"], local_ids)
     if num_tokens >= GROUPED_MIN_TOKENS and state["grouped_moe"]:
@@ -5082,8 +5082,8 @@ def kernel_fn(data, state):
     # Attention: MuseSpark1xAttention.forward.
     qkv = _dense(data["attn_input"], "qkv_gate", state)
     # QK-norm (+ RoPE), q to FP8 and the FP8 cache write in one kernel (slot 0 is a live row here).
-    # c041: full single-token decode at batch >= 16 on SM90 runs attention_decode's Gluon kernel end to end
-    # (q/k norm, FP8 store of the new k/v, attention, RMSNorm x sigmoid(gate)); other steps as c040.
+    # full single-token decode at batch >= 16 on SM90 runs the Gluon kernel end to end
+    # (q/k norm, FP8 store of the new k/v, attention, RMSNorm x sigmoid(gate)); the other cases follow.
     if (not cfg["window"] and length == 8 and batch >= 16 and cfg["page_size"] == 1 and hq == 16 and hkv == 2
             and d == 64 and _SWAP_SM90):
         o = _gluon_full_verify(data, cfg, qkv, tokens, _G_VFC).view(tokens, hq * d)
@@ -5102,11 +5102,11 @@ def kernel_fn(data, state):
         if scaled:
             descale = dict(k_descale=data["k_scale"].reshape(1, 1).expand(batch, hkv),
                            v_descale=data["v_scale"].reshape(1, 1).expand(batch, hkv))
-        if not window and length == 1 and batch >= 16:  # E1 factor B: custom full single-token decode at B >= 16; FA3 for sliding, verify and B < 16
+        if not window and length == 1 and batch >= 16:  # custom full single-token decode at B >= 16; FA3 for sliding, verify and B < 16
             out = _b_full_attention(q8, data)
-        elif not window and length == 8 and batch >= VERIFY_ATTN_MIN_BATCH:  # lane B: full verify blocks
+        elif not window and length == 8 and batch >= VERIFY_ATTN_MIN_BATCH:  # full verify blocks
             out = _v_full_attention(q8, data)
-        elif not window and length in (1, 8) and batch <= SMALL_FULL_MAX_BATCH:  # lane B: small-batch full layers
+        elif not window and length in (1, 8) and batch <= SMALL_FULL_MAX_BATCH:  # small-batch full layers
             out = _s_full_attention(q8, data)
         else:
             out = flash_attn_with_kvcache(
@@ -5126,7 +5126,7 @@ def kernel_fn(data, state):
         if isinstance(out, tuple):
             out = out[0]
         o = state["o_norm_gate"](out.reshape(tokens, hq * d).to(torch.bfloat16), gate)
-    attn_output = _dense(o, "o", state, pref=bool(cfg["window"]) and batch == 1)  # all-reduce: identity; P4: pre-wait W pull only behind P1's early trigger (shape-only)
+    attn_output = _dense(o, "o", state, pref=bool(cfg["window"]) and batch == 1)  # all-reduce: identity; L2 weight prefetch before the wait only behind the attention kernel's early trigger (shape-only)
 
     # Post-attention boundary, router and MoE block: MuseSpark1xMoE._forward_experts.
     split_router = tokens > ROUTER_FP32_MAX_TOKENS
@@ -5143,13 +5143,13 @@ def kernel_fn(data, state):
         elif split_router:
             logits = _router_hilo(ffn_input, state["router_hi_t"], state["router_lo_t"])
         else:
-            if tokens == 8:  # c036: aa2862cc's 8-token FP32 router (fixed-shape branch)
+            if tokens == 8:  # 8-token FP32 router (fixed-shape branch)
                 logits = _router_eight(router_input.contiguous(), state["router"])
             else:
                 logits = F.linear(router_input, state["router"])
         topk_weights, topk_ids = state["routing"](None, logits, TOP_K, True)
         route = None
-        if tokens > 1:  # lane B B018: the grouped route on the side stream, overlapping the pre-expert norm
+        if tokens > 1:  # the grouped route on the side stream, overlapping the pre-expert norm
             routed = torch.cuda.Event()
             routed.record(side_stream)
             route = _grouped_route(topk_ids, data["local_start"])
@@ -5162,18 +5162,18 @@ def kernel_fn(data, state):
             tensor.record_stream(main_stream)
     # This GPU's experts start at local_start: as SGLang's expert_map on that EP rank.
     # all-reduce: identity
-    if tokens == 1 and _SWAP_SM90:  # claude-bf16 A1: the pre-expert norm inside W13's prologue (parent-exact rstd)
+    if tokens == 1 and _SWAP_SM90:  # the pre-expert norm inside W13's prologue (bit-exact rstd)
         expert_output = _experts_d1_n(expert_input, topk_ids, topk_weights, data["local_start"], state)
-    elif tokens == 1:  # c031: the c026 path at one token (pre-expert norm with Marlin's alignment, then Marlin)
+    elif tokens == 1:  # one token without the fused path: pre-expert norm with Marlin's alignment, then Marlin
         expert_input, local_ids, align = _rms_norm_local_ids(expert_input, state["pre_expert_w"], RMS_EPS, topk_ids,
                                                              data["local_start"])
         expert_output = _experts(expert_input, topk_weights, local_ids, state, align)
-    else:  # c030: grouped NVFP4 kernels for every T > 1 (fixed-shape branch); norm without Marlin's alignment
+    else:  # grouped NVFP4 kernels for every T > 1 (fixed-shape branch); norm without Marlin's alignment
         expert_input, _, _ = _rms_norm_local_ids(expert_input, state["pre_expert_w"], RMS_EPS, topk_ids,
                                                  data["local_start"], want_align=False)
-        main_stream.wait_stream(side_stream)  # lane B B018: the route (side stream) before the grouped experts
+        main_stream.wait_stream(side_stream)  # the route (side stream) before the grouped experts
         if not torch.cuda.is_current_stream_capturing():
-            for tensor in [t for t in route if isinstance(t, torch.Tensor)]:  # lane B B043: incl. W13's list
+            for tensor in [t for t in route if isinstance(t, torch.Tensor)]:  # incl. W13's list
                 tensor.record_stream(main_stream)
         expert_output = _grouped_experts(expert_input, topk_weights, route, state)
     if tokens <= SLICED_UNPOOL_MAX_TOKENS:
@@ -5189,6 +5189,6 @@ def kernel_fn(data, state):
     return next_attn_input, stream, topk_ids
 
 
-# research-attention ra7 variant P4a: attention c046 (a333035e) full-verify config
+# full-attention verify-block launch configuration
 FUSED_CFG[("full", 8)] = dict(block_n=128, warps=4, stages=3, max_split=8, per_sm=4, prefetch=True, min_chunk=256,
                               row_blocks=1, qk8=True, big=dict(per_sm=8), big_min_batch=32)

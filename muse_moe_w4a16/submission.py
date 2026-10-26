@@ -1,6 +1,6 @@
-"""Routed NVFP4 (W4A16) MoE experts for one EP8 rank: claude-moe's grouped Gluon kernels (c166), with claude-moe-b's
-verify path (P8a: from 128 tokens W13 runs on the register path with one weight decode per item of up to 32 rows and
-an 8/16/32-row token tile per item; W2 and everything below 128 tokens are c175's).
+"""Routed NVFP4 (W4A16) MoE experts for one EP8 rank, on grouped Gluon kernels. From 128 tokens (verify) both GEMMs
+run on the register path with a per-item token tile: W13 on work items of up to 32 rows (one weight decode for up to
+32 token rows, 8/16/32-row tile per item) and W2 on items of up to 16 rows (8/16-row tile per item).
 
 Pipeline (4 launches; 3 at decode 1, where each top-k slot is one item and the routing pass is skipped):
   1. _route (Triton, one CTA): maps global expert ids to this rank's experts, groups the (token, slot) pairs by expert
@@ -21,7 +21,7 @@ GEMM data path (per CTA: 4 warps, 64 weight rows, K in blocks of 256):
   2 b2 + b0, so each thread's K values are 32 contiguous bytes); the decode happens in those registers, with no
   shared memory for weights.
 - Activations are the B operand, loaded once per CTA at every token count. They go through an XOR-swizzled shared
-  buffer read by each warp in the B-operand layout (mma_v2), at every token count (P6, VERIFY_SMB = False). With
+  buffer read by each warp in the B-operand layout (mma_v2), at every token count (VERIFY_SMB = False). With
   VERIFY_SMB, from SMB_MIN_M tokens (verify 16/32) each K block is instead stored as a 128-byte-swizzled [BM, BK]
   tile in the logical K order; on sm_90 (H200) the GEMMs multiply it with warpgroup_mma (wgmma), decoding the
   weights in K chunks of 64 just before each chunk's wgmma (register A operand); elsewhere mma_v2 reads the tile.
@@ -87,25 +87,25 @@ NUM_WARPS = 4
 XS_MIN_M = 1
 W13_MAXNREG = {}  # W13 register cap by token count (occupancy, measured on the H200); M >= SMB_MIN_M uses W13_MAXNREG_BIG
 W13_MAXNREG_BIG = 96
-D1_W13_SPLIT = 2  # D023: K split of the decode-1 W13 (partials reduced by _d1_reduce)
-D1_W2_KS = 4  # H-2 (P3): K split of the decode-1 W2
+D1_W13_SPLIT = 2  # K split of the decode-1 W13 (partials reduced by _d1_reduce)
+D1_W2_KS = 4  # K split of the decode-1 W2
 PF_MAX_M = 1  # weight prefetch (register double buffer) at decode 1 only
-IL_MIN_M = 128  # P1 (c183v8): interleaved code+scale blocks from this many tokens ...
+IL_MIN_M = 128  # interleaved code+scale blocks from this many tokens ...
 IL_M = (8,)  # ... and at these token counts
-GU_M = (16, 32)  # c186 (P5g): token counts whose W13 uses the gate/up-paired copy
+GU_M = (16, 32)  # token counts whose W13 uses the gate/up-paired copy
 SMB_MIN_M = 128  # shared-B path (wgmma on sm_90, mma_v2 elsewhere, which checks its data path) from this many tokens
-# claude-moe-b P6: the shared-B path is off. From SMB_MIN_M tokens both GEMMs run the register path (shared X
-# tile, mma_v2), W13 still capped at 96 registers: on the H200 (pod b, e1-001/e2-001) that is 7-8% faster per
-# verify call than shared-B + wgmma, bit-exact. Set True to restore c175's verify path.
+# The shared-B path is off. From SMB_MIN_M tokens both GEMMs run the register path (shared X
+# tile, mma_v2), W13 still capped at 96 registers: on the H200 that is 7-8% faster per
+# verify call than shared-B + wgmma, bit-exact. Set True to restore the shared-B verify path.
 VERIFY_SMB = False
-MIX_MIN_M = 128  # P7: from this many tokens the GEMMs are _w13_mix/_w2_mix (token tile chosen per work item)
-# P7a: W2 at verify is research-platform's (H-9). W2 keeps c175's verify path (shared-B + wgmma, _w2); only W13
-# changes. False gives P7 (W2 also on the register path with the per-item tile).
+MIX_MIN_M = 128  # from this many tokens the GEMMs are _w13_mix/_w2_mix (token tile chosen per work item)
+# True keeps W2 at verify on the shared-B path (shared-B + wgmma, _w2) and changes only W13. False (used) runs
+# W2 on the register path with the per-item tile as well.
 W2_VERIFY_C175 = False
-# P8a: from MIX_MIN_M tokens W13 runs on its own work list of items of up to BM_W13 rows (one weight decode for up
+# From MIX_MIN_M tokens W13 runs on its own work list of items of up to BM_W13 rows (one weight decode for up
 # to 32 token rows; 8/16/32-row tile per item) while W2 keeps the 16-row list; both lists come from one routing pass.
 BM_W13 = 32
-W13_MAXNREG_MIX = 128  # the 32-row tile needs 128 registers to run without spills (e8-001)
+W13_MAXNREG_MIX = 128  # the 32-row tile needs 128 registers to run without spills
 
 
 @triton.jit
@@ -147,7 +147,7 @@ def _route(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, P, local_start,
 def _route2(ids_ptr, local_ptr, sorted_ptr, work_ptr, nwork_ptr, work2_ptr, nwork2_ptr, P, local_start,
             LOCAL: tl.constexpr, BM: tl.constexpr, BM2: tl.constexpr, P_BLOCK: tl.constexpr, W_MAX: tl.constexpr,
             W_MAX2: tl.constexpr):
-    """_route, plus a second work list over the same sorted pairs with items of at most BM2 rows (P8a: W13's)."""
+    """_route, plus a second work list over the same sorted pairs with items of at most BM2 rows (W13's)."""
     offs = tl.arange(0, P_BLOCK)
     pm = offs < P
     gid = tl.load(ids_ptr + offs, mask=pm, other=-1)
@@ -265,7 +265,7 @@ LW16 = gl.constexpr(gl.DistributedLinearLayout(
                [0, 0, 1, 0, 0, 0], [0, 0, 2, 0, 0, 0], [0, 0, 4, 0, 0, 0]],
     lane_bases=[[0, 1, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0], [4, 0, 0, 0, 0, 0]],
     warp_bases=[[16, 0, 0, 0, 0, 0], [32, 0, 0, 0, 0, 0]], block_bases=[], shape=[64, 4, 8, 2, 2, 2]))
-# The same decode for one K chunk of 64 (c152): words [BN, 4 (q), 2 (word)], so a chunk's decoded A operand is 16
+# The same decode for one K chunk of 64: words [BN, 4 (q), 2 (word)], so a chunk's decoded A operand is 16
 # registers per thread instead of 64.
 LW16C = gl.constexpr(gl.DistributedLinearLayout(
     reg_bases=[[0, 0, 0, 1, 0, 0], [8, 0, 0, 0, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1], [0, 0, 1, 0, 0, 0]],
@@ -306,7 +306,7 @@ LX2_8 = gl.constexpr(gl.DistributedLinearLayout(
 LXG = gl.constexpr(gl.BlockedLayout(size_per_thread=[1, 8], threads_per_warp=[4, 8], warps_per_cta=[4, 1], order=[1, 0]))
 # ... and the shared buffer, 16-byte chunks XOR-swizzled by row so a quarter warp's rows hit distinct banks.
 X_SMEM = gl.constexpr(gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=8, order=[1, 0]))
-# Shared-B mode (c150): each K block of activations is stored once as [BM, BK] in the MMA's logical K order, 128-byte
+# Shared-B mode: each K block of activations is stored once as [BM, BK] in the MMA's logical K order, 128-byte
 # swizzled. On sm_90 (H200) the GEMMs read it with wgmma, the decoded weights being wgmma's register A operand (the
 # k_width-2 operand layout below is the same register fragment); elsewhere mma_v2 reads it.
 XB_SMEM = gl.constexpr(gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2))
@@ -439,7 +439,7 @@ def _w13_silu(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     pid_n = gl.program_id(0)
     pid_w = gl.program_id(1)
-    KS: gl.constexpr = K // SPLIT  # D023: with SPLIT > 1 (M = 1 only) program (., ., k) covers K part k and stores
+    KS: gl.constexpr = K // SPLIT  # with SPLIT > 1 (M = 1 only) program (., ., k) covers K part k and stores
     pid_k = gl.program_id(2) if SPLIT > 1 else 0  # fp32 gate/up partial sums; _d1_reduce adds them
     kb = pid_k * KS
     if DIRECT:  # M = 1: slot pid_w of the only token is one item of one row; no routing pass
@@ -458,8 +458,8 @@ def _w13_silu(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
-        BLKW: gl.constexpr = BN * 36 if IL else BN * 32  # IL (P1): codes then scales per 9216 B block
+        KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
+        BLKW: gl.constexpr = BN * 36 if IL else BN * 32  # IL: codes then scales per 9216 B block
         BLKB: gl.constexpr = BN * 144 if IL else BN * 16
         S0: gl.constexpr = BN * 128 if IL else 0
         w_off = (e * (2 * I // BN) + pid_n) * KB * BLKW + rw * 32 + qw * 8 + jw
@@ -533,7 +533,7 @@ def _w13_silu(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out
         ro = r0 + m_o
         pair_o = gl.load(sorted_ptr + ro, mask=ro < r1, other=0)
         omask = gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1)
-        if SPLIT > 1:  # c194: fp32 partials [SPLIT, TOP_K, 2 I], gate columns then up columns
+        if SPLIT > 1:  # fp32 partials [SPLIT, TOP_K, 2 I], gate columns then up columns
             pptr = out_ptr + pid_k * (8 * 2 * I) + gl.expand_dims(pair_o, 0) * (2 * I) + gl.expand_dims(n0 + n_o, 1)
             gl.store(pptr, acc_g, mask=omask)
             gl.store(pptr + I, acc_u, mask=omask)
@@ -580,7 +580,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
     if active:
         n0 = pid_n * BN
         rw, qw, jw = _idx3(BN, 4, 8, L3)
-        KB: gl.constexpr = K // BK  # c175: tile-major weights
+        KB: gl.constexpr = K // BK  # tile-major weights
         BLKW: gl.constexpr = BN * 36 if IL else BN * 32
         BLKB: gl.constexpr = BN * 144 if IL else BN * 16
         S0: gl.constexpr = BN * 128 if IL else 0
@@ -634,7 +634,7 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
         m_o = gl.arange(0, BM, layout=gl.SliceLayout(0, mma))
         ro = r0 + m_o
         pair_o = gl.load(sorted_ptr + ro, mask=ro < r1, other=0)
-        if GU:  # c186: rows 16 s + i are gate column 8 s + i of this tile's 32, rows 16 s + 8 + i its up rows
+        if GU:  # rows 16 s + i are gate column 8 s + i of this tile's 32, rows 16 s + 8 + i its up rows
             rows2 = gl.expand_dims(n_o, 1) + gl.expand_dims(m_o * 0, 0)
             pair2 = gl.expand_dims(pair_o, 0) + gl.expand_dims(n_o * 0, 1)
             msk2 = gl.expand_dims(ro < r1, 0) & gl.expand_dims(n_o >= 0, 1)
@@ -657,9 +657,9 @@ def _w2(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
             gl.store(out_ptr + pid_w * N + pid_n * BN + zo, gl.zeros([BN], gl.bfloat16, layout=zl))
 
 
-# ---- H-2 (part P3), from research-moe: handed over by main in inbox-079; source rm1_probe.py sha256 05a88272...
+# ---- split-K W2 at decode 1 ----
 # _w2_ks splits decode-1 W2 over K into KS CTAs writing fp32 partials; _wsum_ks is SGLang's post-expert norm weighted
-# sum (same math, order and rsqrt) that first adds the KS partials and rounds once to BF16. Copied verbatim.
+# sum (same math, order and rsqrt) that first adds the KS partials and rounds once to BF16.
 @gluon.jit
 def _w2_ks(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
            K: gl.constexpr, N: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr, KS: gl.constexpr,
@@ -738,7 +738,7 @@ def _wsum_ks(Y, NW, TW, OUT, IDS, eps, H: tl.constexpr, KS: tl.constexpr, TOPK: 
 
 @triton.jit
 def _d1_reduce(P, GS, IDS, INTER, I: tl.constexpr, S: tl.constexpr, BLOCK: tl.constexpr, NLOC: tl.constexpr):
-    """c194, M = 1: inter[slot] = SiLU(gate) * up from W13's S fp32 partials [S, 8, 2I] of each local slot, with
+    """M = 1: inter[slot] = SiLU(gate) * up from W13's S fp32 partials [S, 8, 2I] of each local slot, with
     W13's own scale and roundings. Program (slot, column block); non-local slots return."""
     slot = tl.program_id(0)
     lid = tl.load(IDS + slot)
@@ -756,9 +756,9 @@ def _d1_reduce(P, GS, IDS, INTER, I: tl.constexpr, S: tl.constexpr, BLOCK: tl.co
         tl.store(INTER + slot * I + c, v.to(tl.bfloat16))
 
 
-# P7 (claude-moe-b): verify-path kernels whose CTAs pick their token tile per work item. An item of at most 8 rows
+# Verify-path kernels whose CTAs pick their token tile per work item. An item of at most 8 rows
 # (most experts' last item at verify) runs the 8-row tile: half the MMAs, X staging and epilogue of a 16-row tile,
-# with the same weight stream and decode. The bodies are _w13_silu's and _w2's non-DIRECT bodies, verbatim.
+# with the same weight stream and decode. The bodies are _w13_silu's and _w2's non-DIRECT bodies.
 @gluon.jit
 def _w13_item(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_n,
               K: gl.constexpr, I: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
@@ -767,7 +767,7 @@ def _w13_item(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     n0 = pid_n * BN
     rw, qw, jw = _idx3(BN, 4, 8, L3)
-    KB: gl.constexpr = K // BK  # c175: tile-major weights, see _tile_major
+    KB: gl.constexpr = K // BK  # tile-major weights, see _tile_major
     w_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
     rs, qs, gs_ = _idx3(BN, 4, 4, LS)
     s_off = (e * (2 * I // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -881,7 +881,7 @@ def _w2_item(a_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, out_ptr, e, r0, r1, pid_n
     a_l: gl.constexpr = (A3_8 if BM == 8 else A3_16) if HOP else A_L
     n0 = pid_n * BN
     rw, qw, jw = _idx3(BN, 4, 8, L3)
-    KB: gl.constexpr = K // BK  # c175: tile-major weights
+    KB: gl.constexpr = K // BK  # tile-major weights
     w_off = (e * (N // BN) + pid_n) * KB * (BN * 32) + rw * 32 + qw * 8 + jw
     rs, qs, gs_ = _idx3(BN, 4, 4, LS)
     s_off = (e * (N // BN) + pid_n) * KB * (BN * 16) + rs * 16 + qs * 4 + gs_
@@ -981,7 +981,7 @@ def _permute_bits(packed):
 
 
 def _tile_major(codes, sf):
-    """c175: codes uint8 [L, rows, K/2] and fp8 scales [L, rows, K/16] -> the same bytes ordered tile-major, so that
+    """Codes uint8 [L, rows, K/2] and fp8 scales [L, rows, K/16] -> the same bytes ordered tile-major, so that
     each (expert, BN-row tile, BK block) is one contiguous BN x 128 B run of codes and one BN x 16 B run of scales
     (a lossless permutation of bytes; contiguous blocks stream from DRAM better than BN rows 2 KB apart)."""
     n_l, rows, half_k = codes.shape
@@ -992,7 +992,7 @@ def _tile_major(codes, sf):
 
 
 def _gu_rows(I):
-    """c186: row order of the gate/up-paired W13 copy. New row 64 t + 16 s + 8 g + i holds gate (g = 0) or up (g = 1)
+    """Row order of the gate/up-paired W13 copy. New row 64 t + 16 s + 8 g + i holds gate (g = 0) or up (g = 1)
     row of output column 32 t + 8 s + i (a lossless row permutation)."""
     r = torch.arange(2 * I)
     t, s, g, i = r // 64, (r % 64) // 16, (r % 16) // 8, r % 8
@@ -1000,7 +1000,7 @@ def _gu_rows(I):
 
 
 def _interleaved(c, s):
-    """P1 (c183): tile-major codes and scales merged per block (codes then scales, 9216 B), a second lossless copy
+    """Tile-major codes and scales merged per block (codes then scales, 9216 B), a second lossless copy
     used from IL_MIN_M tokens and at IL_M, where it streams better."""
     n_l, nt, kb = c.shape[:3]
     blk = torch.cat([c.reshape(n_l, nt, kb, -1), s.view(torch.uint8).reshape(n_l, nt, kb, -1)], dim=3).contiguous()
@@ -1035,12 +1035,12 @@ def _decode1_direct(x, ids, tw, state, H, I, L):
     """M = 1: three launches (W13 + SiLU, W2, post-expert norm); each top-k slot is one item, no routing pass."""
     dev = x.device
     inter = torch.empty((TOP_K, I), dtype=torch.bfloat16, device=dev)
-    if 1 in GU_M:  # c186: gate/up-paired W13, one weight stream per CTA
+    if 1 in GU_M:  # gate/up-paired W13, one weight stream per CTA
         _w2[(2 * I // BN, TOP_K)](x, state["w13g"], state["w13g_sf"], state["w13_gs"], state["iota8"], ids,
                                   state["local_start_t"], inter, K=H, N=2 * I, BN=BN, BK=BK, BM=8, XS=True, SMB=False,
                                   HOP=False, CHK=False, PF=True, DIRECT=True, NLOC=L, GU=True, num_warps=NUM_WARPS)
     else:
-        S = D1_W13_SPLIT  # D023: W13 split over K, partials reduced by a small kernel
+        S = D1_W13_SPLIT  # W13 split over K, partials reduced by a small kernel
         part = torch.empty((S, TOP_K, 2 * I), dtype=torch.float32, device=dev)
         _w13_silu[(I // BN, TOP_K, S)](x, state["w13"], state["w13_sf"], state["w13_gs"], state["iota8"], ids,
                                        state["local_start_t"], part, K=H, I=I, BN=BN, BK=BK, BM=8, XS=True, SMB=False,
@@ -1048,7 +1048,7 @@ def _decode1_direct(x, ids, tw, state, H, I, L):
                                        num_warps=NUM_WARPS)
         _d1_reduce[(TOP_K, I // 1024)](part, state["w13_gs"], state["local_start_t"][1:], inter, I=I, S=S,
                                        BLOCK=1024, NLOC=L, num_warps=4)
-    ks = D1_W2_KS  # H-2: W2 split over K, fp32 partials summed inside the weighted sum
+    ks = D1_W2_KS  # W2 split over K, fp32 partials summed inside the weighted sum
     yp = torch.empty((ks, TOP_K, H), dtype=torch.float32, device=dev)
     _w2_ks[(H // BN, TOP_K, ks)](inter, state["w2"], state["w2_sf"], state["w2_gs"], state["iota8"], ids,
                                  state["local_start_t"], yp, K=I, N=H, BK=BK, BM=8, KS=ks, PF=True, NLOC=L,
@@ -1085,7 +1085,7 @@ def kernel_fn(data, state):
     sorted_pairs = torch.empty((P,), dtype=torch.int32, device=dev)
     work = torch.empty((w_max, 3), dtype=torch.int32, device=dev)
     nwork = torch.empty((1,), dtype=torch.int32, device=dev)
-    if M >= MIX_MIN_M:  # P8a: one routing pass, two work lists (W2's 16-row items, W13's BM_W13-row items)
+    if M >= MIX_MIN_M:  # one routing pass, two work lists (W2's 16-row items, W13's BM_W13-row items)
         bm13 = BM_W13
         w_max13 = triton.next_power_of_2(triton.cdiv(P, bm13) + L)
         work13 = torch.empty((w_max13, 3), dtype=torch.int32, device=dev)
@@ -1096,14 +1096,14 @@ def kernel_fn(data, state):
         _route[(1,)](ids, local, sorted_pairs, work, nwork, P, ls, LOCAL=L, BM=bm, P_BLOCK=p_block, W_MAX=w_max,
                      num_warps=16 if p_block >= 1024 else 4)
     inter = torch.empty((P, I), dtype=torch.bfloat16, device=dev)
-    il = M in IL_M  # P1 at M = 8 only (it conflicts with P8 at M >= 128: bundle note, e3-001)
+    il = M in IL_M  # interleaved blocks at M = 8 only (they do not combine with the per-item verify kernels at M >= 128)
     w13c, w13s = state["il13"] if il else (state["w13"], state["w13_sf"])
     w2c, w2s = state["il2"] if il else (state["w2"], state["w2_sf"])
-    if M in GU_M:  # c186: gate/up-paired W13 at these token counts
+    if M in GU_M:  # gate/up-paired W13 at these token counts
         _w2[(2 * I // BN, w_max)](x, state["w13g"], state["w13g_sf"], state["w13_gs"], sorted_pairs, work, nwork,
                                   inter, K=H, N=2 * I, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=False, HOP=False,
                                   CHK=True, PF=M <= PF_MAX_M, GU=True, num_warps=NUM_WARPS)
-    elif M >= MIX_MIN_M:  # P8 (lane B): W13 on 32-row items, per-item tile, register path
+    elif M >= MIX_MIN_M:  # W13 on 32-row items, per-item tile, register path
         smb = VERIFY_SMB and M >= SMB_MIN_M
         _w13_mix[(I // BN, w_max13)](x, state["w13"], state["w13_sf"], state["w13_gs"], sorted_pairs, work13, nwork13,
                                      inter, K=H, I=I, BN=BN, BK=BK, BM=bm13, XS=M >= XS_MIN_M, SMB=smb,
@@ -1115,7 +1115,7 @@ def kernel_fn(data, state):
                                     HOP=state["hopper"] and M >= SMB_MIN_M, CHK=True, PF=M <= PF_MAX_M,
                                     IL=il, num_warps=NUM_WARPS, **_w13_regcap(M))
     y = torch.empty((P, H), dtype=torch.bfloat16, device=dev)
-    if M >= MIX_MIN_M and not W2_VERIFY_C175:  # P8: W2 on the register path with the per-item tile
+    if M >= MIX_MIN_M and not W2_VERIFY_C175:  # W2 on the register path with the per-item tile
         smb2 = VERIFY_SMB and M >= SMB_MIN_M
         _w2_mix[(H // BN, w_max)](inter, state["w2"], state["w2_sf"], state["w2_gs"], sorted_pairs, work, nwork, y,
                                   K=I, N=H, BN=BN, BK=BK, BM=bm, XS=M >= XS_MIN_M, SMB=smb2,

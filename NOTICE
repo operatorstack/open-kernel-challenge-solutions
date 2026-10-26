@@ -1,0 +1,45 @@
+Open Kernel Challenge solutions (team bigboateng)
+Copyright (c) 2026 bigboateng. Licensed under the MIT License (see LICENSE),
+except for the portions listed below.
+
+This repository uses and reproduces code from SGLang
+(https://github.com/sgl-project/sglang), Copyright the SGLang authors,
+licensed under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). The SGLang-derived portions
+listed below remain under the Apache License 2.0. The solutions also import
+SGLang (sglang, sgl_kernel) at run time; those packages are not included here.
+
+muse_moe_w4a16/submission.py
+  - Imports _post_expert_norm_weighted_sum_kernel from
+    sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_triton.py.
+  - _wsum_ks reproduces that kernel's body (same math, order and rsqrt), with
+    one change: it first sums FP32 split-K partials and rounds them to BF16.
+
+muse_bf16_proj/submission.py
+  - Imports _bf16_gemm_dispatch_impl from
+    sglang/srt/layers/quantization/unquant.py (the reference path for every
+    shape this file does not serve with its own kernels).
+  - The router's hi/lo split with FP32 accumulation follows
+    MuseSpark1xRouter.forward_split2.
+
+muse_decode_layer/submission.py
+  - _post_expert_ws_pdl_kernel reproduces the body of SGLang's
+    _post_expert_norm_weighted_sum_kernel
+    (sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_triton.py),
+    with programmatic dependent launch added, and with an optional sum of FP32
+    split-K partials before the norm.
+  - _rms_norm_local_ids_kernel reimplements SGLang's single-CTA
+    moe_align_small_numel algorithm (same "+1 offset" buckets) inside the
+    pre-expert norm kernel.
+  - Imports SGLang modules and kernels: _post_expert_norm_weighted_sum_kernel,
+    silu_and_mul, moe_wna16_marlin_gemm, FusedMuseSparkRouting,
+    FusedRMSNormGate, FusedPostNormResidualPreNorm, fused_norm_residual,
+    moe_align_block_size, MuseSpark1xNormPreservingResidualConnection,
+    MuseSpark1xRMSNorm, MuseSpark1xRMSNormWithInputScale,
+    marlin_make_workspace, prepare_moe_nvfp4_layer_for_marlin,
+    _bf16_gemm_dispatch_impl, and sgl_kernel's flash_attn_with_kvcache and
+    scalar_types.
+
+muse_attention_decode/submission.py
+  - Imports sgl_kernel's flash_attn_with_kvcache and SGLang's rms_norm_gate
+    (sglang/kernels/ops/muse_spark_v12/norm_gate.py).

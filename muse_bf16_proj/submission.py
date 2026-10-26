@@ -1,40 +1,9 @@
 # okc: problem=muse_bf16_proj
-"""Candidate c049c: c048 (official parent, job 6224d0f5, 1.30168) plus a bundle of five parts, each screened on c048 on the H200 plane (real SGLang comparator, same job as c048's own path): (P6a) the pooler at exactly 128 tokens computes the same product with cuBLAS on swapped operands, torch.mm(W, x^T), and returns its transpose (a column-major view of the required shape and dtype; 0.954 of c048's time, job h54b; it ran in c045's official check); (H1a) the unpooler at 9-32 tokens streams its weights from a lossless tile-contiguous copy made in prepare() ([N/64, K/256, 64, 256], so every TMA box is one contiguous 32 KB block; 0.959 / 0.961 at 16 / 32 tokens, job h62); (H1b, H1d) the pooler at 2-32 tokens does the same with 64-row tiles (0.927 at 32 tokens, job h62; 0.959 / 0.966 at 8 / 16 tokens, job h65). (H1e) qkv_gate at exactly 128 tokens runs c043's split-K wgmma GEMM (64 x 128, 3 K ranges) on the same kind of tile-contiguous copy (0.955, job h67). Same kernels, K order and FP32 accumulation as c048 for H1a/H1b/H1d/H1e.
+"""Dense BF16 projections of Muse Spark Open for one H200 under TP8: qkv_gate [2304 x 8192], o [8192 x 1024],
+pooler [4096 x 8192], unpooler [8192 x 4096] (up to 8 tokens only this GPU's 1024-row slice) and the router, whose
+weight is FP32 [256 x 8192] and whose output is FP32.
 
-Candidate c048: c047 plus one change -- the unpooler's 1024-row slice at 2-8 tokens runs c046's cluster split-K kernel (64 weight rows x 256-wide K blocks, 4 K ranges reduced through distributed shared memory in a 4-CTA cluster) instead of c043's swap-AB streaming kernel with a global last-arriver reduction. H200 plane (job h51, real SGLang comparator, same job): 5.47 vs 6.30 us at 8 tokens (0.868). Falls back to c043's kernel if the cluster launch is unavailable at first use (before capture).
-
-Candidate c047: c046 plus one change -- the router at 8-256 tokens keeps c043's two kernels (BF16 hi/lo partials over K ranges, then a reduce kernel), their tilings and arithmetic, but launches the reduce kernel with programmatic dependent launch: the partials kernel signals griddepcontrol.launch_dependents (at its start; after its K loop at 256 tokens) and the reduce kernel starts with griddepcontrol.wait, which blocks until the partials grid has completed and its writes are visible. Only the kernel boundary changes. H200 plane (job h49, real SGLang comparator, same job): 0.919 / 0.957 / 0.921 / 0.933 / 0.923 of c043's router time at 8 / 16 / 32 / 128 / 256 tokens. If the launch option is unavailable at first use (before capture), c043's launches serve the router.
-
-Candidate c046: c043 (official parent, job ead2b544, 1.27918) plus one change -- qkv_gate at 2-32 tokens runs a split-K weight-streaming kernel whose K ranges are reduced inside a Hopper thread-block cluster through distributed shared memory instead of through global partials and counters. The kernel is c043's TMA streaming kernel (64 weight rows x 256-wide K blocks, 3 K ranges, 4 stages), launched as clusters of 3 CTAs (one cluster per output tile); ranks 1-2 stage their FP32 partial tile in their own shared memory and copy it with 16-byte stores into rank 0's shared memory, one cluster barrier publishes it, and rank 0 adds the three partials and stores BF16. Nothing persists between calls. H200 plane (jobs h42-h46, real SGLang comparator, overhead 2*t1-t2): 11.9 vs 13.3 us at 8 and 16 tokens, 13.1 vs 14.1 us at 32 tokens against c043's own kernels in the same job.
-
-Candidate c043: c042 plus two H200-plane retiles (job h26, real SGLang comparator): the router at one token on aa2862cc's one-token GEMV form with FP32 output (1 row x 2048, 32 warps; 2.65 vs 2.89 us), and o at 2-32 tokens on TMA streaming (64 weight rows x 256-wide K blocks, no K split; 3-8% faster than the swap-AB streaming tile).
-
-Candidate c042: c041 plus the router at 8 and 32 tokens on the two-kernel hi/lo form with H200-plane tilings (job h18d, real SGLang comparator: m8 5.10 vs ~6.0 us for aa2862cc's FP32 CUDA-core kernel, m32 5.79 vs ~7.1 us for aa2862cc's split-K tiling). The hi + lo split with FP32 accumulation passes the router check at any m (TASK.md).
-
-Candidate c041: c040 plus retuned router kernels ranked on the H200 plane (jobs h16-h17, real SGLang comparator): the router at 16/128/256 tokens keeps aa2862cc's two-kernel hi/lo structure (BF16 hi + lo products, separate FP32 accumulators, K-split partials then a reduce kernel) with deeper pipelines and tilings chosen on the H200; plus TMA streaming for the unpooler at 9-32 tokens and for qkv_gate at 9-16 tokens.
-
-Candidate c040: c030r (official parent, job 5f485773, 1.18742) unchanged, plus one composed change ranked on the H200 plane (jobs h05, h08, h09): c039's parts with retuned tilings -- one-token CUDA-core GEMVs for qkv_gate, o, the pooler, the unpooler slice (1 x 2048, 4 warps) and the router; TMA streaming for the pooler at 2-32 tokens (32 weight rows x 256-wide K blocks, no K split); streaming for o at 2-32 tokens and the unpooler slice at 2-8 tokens; TMA streaming for qkv_gate at 17-32 tokens; and the split-K wgmma GEMM at exactly 128 tokens for qkv_gate (64 x 128, split 3) and the pooler (64 x 128, split 2).
-
-Candidate c039: c030r (official parent, job 5f485773, 1.18742) unchanged, plus one composed change ranked on the H200 plane (jobs h02-h05) -- one-token CUDA-core GEMVs for qkv_gate (1 x 4096, 16 warps), o (2 x 1024, 4 warps), the pooler (1 x 4096, 16 warps; replaces aa2862cc's 4 x 2048 tiling) and the router (FP32, 16 warps); the swap-AB streaming MMA kernel for o at 2-32 tokens (64 weight rows x 128-wide K blocks, no K split) and for the unpooler's 1024-row slice at 2-8 tokens; a TMA streaming tiling for qkv_gate at 17-32 tokens; and the split-K wgmma GEMM for the pooler at exactly 128 tokens.
-
-Candidate c037: c030r (official parent, job 5f485773, 1.18742) unchanged, plus one composed change (each part below or near the 0.382% margin alone) -- one-token CUDA-core GEMVs for qkv_gate (1 row x the whole K, 16 warps) and the router (FP32 weights, 16 warps), the pooler at exactly 128 tokens on the split-K wgmma GEMM, and the unpooler's 1024-row slice at 2-8 tokens on the swap-AB streaming kernel (32 weight rows x 4 K ranges).
-
-Candidate c031b: c030r unchanged, plus one composed change (each part below the 0.382% margin alone, jointly ~+0.7%) -- one-token CUDA-core GEMVs for qkv_gate (1 row x the whole K, 16 warps) and the router (FP32 weights, 16 warps; H200 2.701 in job 7c81bace), and the pooler at exactly 128 tokens on the split-K wgmma GEMM (H200 1.042 vs 1.001 in job 70e5a3d7).
-
-Candidate c030r: candidate c028 unchanged, plus one change -- the unpooler at one token (this GPU's 1024-row
-slice, 8.4 MB) runs a CUDA-core GEMV (2 rows x the whole K per program, 512 programs, one load burst each)
-instead of SGLang's path, which reads the slice at about 1.2 TB/s on H200.
-
-c028 (kept as is): the official parent c027 (job 3a3ff4e4, 1.1598) unchanged, plus one change -- the pooler at 2-32
-tokens runs claude-bf16's TMA weight-streaming MMA kernel (swap-AB, 32-row weight tiles x 2 K ranges = 256
-programs, K ranges reduced in-kernel). On H200 this exact kernel and tiling read 1.091 against SGLang at 32 tokens
-(job 7c81bace); at 2-16 tokens it streams the same weights with a smaller token tile.
-
-c027 (kept as is): aa2862cc plus qkv_gate at 1-16 tokens on claude-bf16's weight-streaming MMA kernel (swap-AB,
-72 weight tiles x 11 uneven K ranges = 792 programs). Every other case runs aa2862cc's path byte-for-byte.
-
-aa2862cc's description, for the paths it keeps -- SGLang's dense projections for Muse Spark Open on H200, at
-SGLang commit a55ab7d5ae1bba59ac351e55026fe7f7644ecc5f:
+Reference: SGLang's dense projections at commit a55ab7d5ae1bba59ac351e55026fe7f7644ecc5f:
 
   qkv_gate, o, pooler    bf16_gemm_dispatch (cuBLAS on H200)
   unpooler               bf16_gemm_dispatch: up to 8 tokens on this GPU's 1/8 slice of the
@@ -42,6 +11,36 @@ SGLang commit a55ab7d5ae1bba59ac351e55026fe7f7644ecc5f:
   router                 FP32 weight: F.linear in FP32 up to 8 tokens, above that two BF16
                          GEMMs on a hi/lo split of the weight with FP32 accumulation
                          (MuseSpark1xRouter.forward_split2)
+
+_cbf_dispatch picks a kernel by (layer, token count), each tiling chosen by measurement on the H200; every case it
+does not serve runs SGLang's path unchanged.
+
+  one token        CUDA-core GEMVs with FP32 accumulation (_cbf_gemv32 for qkv_gate, o, the pooler and the unpooler
+                   slice; _cbf_gemv_rows32 for the router, FP32 weights and output). At one token these projections
+                   are bandwidth-bound and a GEMV with one load burst per row reads the weights faster than a GEMM.
+  2-32 tokens      Swap-AB weight streaming: 64 (or 32) weight rows fill the MMA's M side, the few tokens are padded
+                   to 16-32 on its N side, and tiles arrive by TMA from host-built tensor descriptors.
+                   - qkv_gate: split-K over 3 K ranges reduced inside a 3-CTA thread-block cluster through distributed
+                     shared memory (_cbf_cluster*): ranks 1-2 copy their FP32 partial tile with 16-byte
+                     st.shared::cluster stores into rank 0's shared memory, barrier.cluster publishes it and rank 0
+                     adds the partials and stores BF16. No global partials, counters or extra launch.
+                   - the unpooler slice at 2-8 tokens: the same cluster kernel with 4-CTA clusters.
+                   - the pooler (2-32) and the unpooler (9-32): TMA streaming from a lossless tile-contiguous copy of
+                     the weight made in prepare() ([N/64, K/256, 64, 256], so every TMA box is one contiguous 32 KB
+                     block).
+                   - o: TMA streaming, 64 weight rows x 256-wide K blocks, no K split.
+  router 8-256     BF16 hi + lo products of the FP32 weight with separate FP32 accumulators over K ranges, then a
+                   reduce kernel; the reduce kernel is chained to the partials kernel with programmatic dependent
+                   launch (griddepcontrol.launch_dependents / griddepcontrol.wait), so its launch overlaps the
+                   partials grid.
+  128 tokens       qkv_gate: split-K wgmma GEMM (64 weight rows x 128-wide K blocks, 3 K ranges) on a
+                   tile-contiguous weight copy.
+                   pooler: cuBLAS on swapped operands, torch.mm(W, x^T), returned as its transpose (a column-major
+                   view with the required shape and dtype).
+
+Every weight copy made in prepare() is a lossless permutation of the same BF16 values; K order and FP32 accumulation
+are fixed per shape. Optional launch features (PDL, clusters) are tried on first use, which happens before CUDA-graph
+capture; if one is unavailable the case falls back to a plain launch of the same arithmetic.
 
 Differs from SGLang: the sliced unpooler's all-gather is not run.
 """
@@ -80,10 +79,10 @@ class Inputs(TypedDict):
 ROUTER_FP32_MAX_TOKENS = 8
 
 
-# ---- claude-bf16 small-m streaming block (names prefixed _cbf_ / CBF_) ----
+# ---- small-m streaming block (names prefixed _cbf_ / CBF_) ----
 # Swap-AB MMA weight streaming with K split into ranges of whole blocks and an in-kernel last-arriver
 # reduction (self-resetting counters). CBF_ENABLED lists the (layer, m bucket) cases this block serves;
-# everything else returns None and runs aa2862cc's path.
+# everything else returns None and runs the base path.
 
 
 @triton.jit
@@ -157,9 +156,9 @@ def _cbf_launch(x, w, n, state, cfg, block_m):
 
 # Streaming MMA: (layer, m bucket 16 = 1-16 tokens, 32 = 17-32 tokens) -> BLOCK_N, BLOCK_K, SPLIT_K, warps, stages.
 CBF_STREAM = {
-    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 at m=1, job 7c81bace)
-    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200 plane 1.08 / 1.10 at m8 / m16, job h05)
-    ("o", 32): (64, 128, 1, 4, 4),            # H200 plane 1.08 at m32 (job h05)
+    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 vs SGLang at m=1)
+    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200: 1.08 / 1.10 vs SGLang at m8 / m16)
+    ("o", 32): (64, 128, 1, 4, 4),            # H200: 1.08 vs SGLang at m32
 }
 # Cases served: qkv_gate at 1-16 tokens (one token runs the same 16-wide MMA tile).
 CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
@@ -168,7 +167,7 @@ CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 except Exception:  # older Triton: the pointer kernel is used everywhere
-    TensorDescriptor = None  # older Triton: the pooler case keeps aa2862cc's path
+    TensorDescriptor = None  # older Triton: the pooler case keeps the base path
 
 
 @triton.jit
@@ -240,12 +239,12 @@ def _cbf_launch_tma(x, w, w2, n, state, cfg, block_m, out_dtype):
 
 # layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, served at 2-32 tokens (BLOCK_M = tokens rounded up
 # to a power of two, at least 16)
-# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200 plane 1.068 vs SGLang, job h05)
+# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200: 1.068 vs SGLang)
 CBF_TMA32 = {"qkv_gate": (64, 128, 3, 4, 4)}
 CBF_TMA = {
-    "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200 plane 5-6% faster than (32, 128, 2, 4, 5), job h09)
-    "o": (64, 256, 1, 4, 4),          # 2-32 tokens; H200 plane 3-8% faster than the swap-AB streaming tile, job h26
-    "unpooler": (64, 256, 1, 4, 4),   # 9-32 tokens (2-8 take the slice path first); H200 plane 17.0 vs 17.2-17.4 us SGLang, job h15
+    "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200: 5-6% faster than (32, 128, 2, 4, 5))
+    "o": (64, 256, 1, 4, 4),          # 2-32 tokens; on the H200 3-8% faster than the swap-AB streaming tile
+    "unpooler": (64, 256, 1, 4, 4),   # 9-32 tokens (2-8 take the slice path first); H200: 17.0 vs 17.2-17.4 us for SGLang
 }
 
 
@@ -253,7 +252,7 @@ CBF_TMA = {
 def _cbf_gemv_rows(X, W, Y, K: tl.constexpr, N: tl.constexpr, SX: tl.constexpr, SW: tl.constexpr,
                    ROWS: tl.constexpr, TILE_K: tl.constexpr):
     """One token on CUDA cores: ROWS weight rows per program, TILE_K columns per step, FP32 accumulation,
-    weights loaded with .cg (the form of aa2862cc's one-token pooler GEMV)."""
+    weights loaded with .cg (the form of the base one-token pooler GEMV)."""
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     columns = tl.arange(0, TILE_K)
     accum = tl.full((ROWS, TILE_K), 0, tl.float32)
@@ -277,9 +276,9 @@ def _cbf_launch_gemv(x, w, n, cfg):
 # One-token CUDA-core GEMV: layer -> ROWS, TILE_K, num_warps
 CBF_GEMV1 = {
     "qkv_gate": (1, 4096, 16),  # 2304 programs, one row and one load burst each
-    "pooler": (1, 4096, 16),    # H200 plane 15.5 vs 18.2 us for aa2862cc's (4, 2048, 16) (job h05)
-    "o": (2, 1024, 4),          # H200 plane 4.56 vs SGLang 5.50 us (job h05)
-    "unpooler": (1, 2048, 4),   # the 1024-row slice: 1024 programs (H200 plane 2.84 vs 3.49 us for (2, 4096, 4), job h09)
+    "pooler": (1, 4096, 16),    # H200: 15.5 vs 18.2 us for the base (4, 2048, 16) tiling
+    "o": (2, 1024, 4),          # H200: 4.56 vs SGLang 5.50 us
+    "unpooler": (1, 2048, 4),   # the 1024-row slice: 1024 programs (H200: 2.84 vs 3.49 us for (2, 4096, 4))
 }
 
 
@@ -333,7 +332,7 @@ def _cbf_launch_gemv32(x, w, n, state, cfg, out_dtype):
 
 
 # Router at one token: FP32 weights as given, one row per program, 16 warps, no K split
-# (H200: 2.701 against SGLang, job 7c81bace)
+# (H200: 2.701 against SGLang)
 CBF_ROUTER1 = (1, 2048, 1, 16, 1)
 
 
@@ -397,8 +396,8 @@ def _cbf_launch_lm(x, w, n, state, cfg):
 # 128 tokens (verify 16), split-K wgmma GEMM: layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, BLOCK_M
 # (programs: 18 x 7 = 126, 32 x 4 = 128, 128 x 1 = 128; sm_90 cross-compile: HGMMA + UTMALDG, 96-131 KB shared)
 CBF_LM128 = {
-    "qkv_gate": (64, 128, 3, 4, 128),  # 36 x 3 = 108 programs (H200 plane 15.2 vs 16.0 us cuBLAS, job h08)
-    "pooler": (64, 128, 2, 4, 128),    # 64 x 2 = 128 programs (H200 plane 22.6 vs 23.3 us for (128, 64, 4, 8), job h08)
+    "qkv_gate": (64, 128, 3, 4, 128),  # 36 x 3 = 108 programs (H200: 15.2 vs 16.0 us for cuBLAS)
+    "pooler": (64, 128, 2, 4, 128),    # 64 x 2 = 128 programs (H200: 22.6 vs 23.3 us for (128, 64, 4, 8))
 }
 
 
@@ -409,7 +408,7 @@ CBF_UNPOOL8 = (32, 128, 4, 4, 4)
 @triton.jit
 def _cbf_router_partials(X, HI, LO, PARTIAL, M, K: tl.constexpr, N: tl.constexpr, SXM, SXK,
                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr):
-    """aa2862cc's router partials kernel generalised over the tiling: BF16 hi and lo products with separate FP32
+    """The base router partials kernel generalised over the tiling: BF16 hi and lo products with separate FP32
     accumulators over one of SPLIT_K K ranges, summed and stored as an FP32 partial."""
     pid_n = tl.program_id(0)
     split = tl.program_id(1)
@@ -456,23 +455,23 @@ def _cbf_launch_router(x, n, state, cfg):
 
 
 # Router (BF16 hi/lo, two kernels) by exact token count: BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, BLOCK_M
-# (H200 plane, real SGLang comparator: m16 5.11 vs 6.29 us, m128 6.96 vs 10.28, m256 8.90 vs 10.88 for aa2862cc's
-# tilings; jobs h16-h17; 8 and 32 tokens from job h18d).
+# (H200: m16 5.11 vs 6.29 us, m128 6.96 vs 10.28, m256 8.90 vs 10.88 for the base
+# tilings).
 CBF_ROUTER_HILO = {
-    8: (32, 128, 16, 4, 4, 16),      # job h18d: 5.10 us vs aa2862cc's FP32 CUDA-core kernel ~6.0 us
+    8: (32, 128, 16, 4, 4, 16),      # H200: 5.10 us vs ~6.0 us for an FP32 CUDA-core kernel
     16: (32, 64, 32, 4, 4, 16),
-    32: (64, 64, 16, 4, 5, 16),      # job h18d: 5.79 us vs aa2862cc's tiling ~7.1 us
+    32: (64, 64, 16, 4, 5, 16),      # H200: 5.79 us vs ~7.1 us for the base tiling
     128: (32, 128, 8, 4, 5, 64),
     256: (64, 64, 8, 4, 5, 64),
 }
-# TMA streaming for qkv_gate at 9-16 tokens (H200 plane 11.9 vs 12.4 us for the streaming kernel, job h15)
+# TMA streaming for qkv_gate at 9-16 tokens (H200: 11.9 vs 12.4 us for the streaming kernel)
 CBF_TMA16 = {"qkv_gate": (32, 128, 6, 4, 4)}
 
 
 @triton.jit
 def _cbf_gemv_rows32(X, W, Y, K: tl.constexpr, N: tl.constexpr, SX: tl.constexpr, SW: tl.constexpr,
                      ROWS: tl.constexpr, TILE_K: tl.constexpr):
-    """One token on CUDA cores with FP32 weights and FP32 output (the router), aa2862cc's one-token GEMV form."""
+    """One token on CUDA cores with FP32 weights and FP32 output (the router), the base one-token GEMV form."""
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     columns = tl.arange(0, TILE_K)
     accum = tl.full((ROWS, TILE_K), 0, tl.float32)
@@ -493,7 +492,7 @@ def _cbf_launch_router1(x, w, n, cfg):
     return out
 
 
-# Router at one token: ROWS, TILE_K, num_warps (H200 plane 2.65 vs 2.89 us for the 16-warp GEMV, job h26)
+# Router at one token: ROWS, TILE_K, num_warps (H200: 2.65 vs 2.89 us for the 16-warp GEMV)
 CBF_ROUTER1_ROWS = (1, 2048, 32)
 
 
@@ -612,7 +611,7 @@ def _cbf_launch_cluster(x, w, n, state, cfg, block_m):
 # ---- end of cluster block ----
 
 
-# ---- router 8-256 tokens: programmatic dependent launch between c043's partials and reduce kernels ----
+# ---- router 8-256 tokens: programmatic dependent launch between the router's partials and reduce kernels ----
 @triton.jit
 def _cbf_router_partials_pdl(X, HI, LO, PARTIAL, M, K: tl.constexpr, N: tl.constexpr, SXM, SXK,
                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -674,7 +673,7 @@ def _cbf_launch_router_pdl(x, n, state, cfg):
 # ---- end of PDL block ----
 
 
-# ---- tile-contiguous weights (H1a/H1b): W [N, K] stored as [N/BN, K/BK, BN, BK] rows of BK, made in prepare() ----
+# ---- tile-contiguous weights: W [N, K] stored as [N/BN, K/BK, BN, BK] rows of BK, made in prepare() ----
 @triton.jit
 def _cbf_skinny_gemm_tma_tiled(x_desc, w_desc, w2_desc, out_ptr, part_ptr, cnt_ptr, M, N, K,
                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -748,7 +747,7 @@ CBF_TILED = {"unpooler": (64, 256, 1, 4, 4), "pooler": (64, 256, 1, 4, 4)}  # un
 # ---- end of tiled block ----
 
 
-# ---- 128-token split-K GEMM on tile-contiguous weights (part H1e): same kernel, tiling and K split as c043's ----
+# ---- 128-token split-K GEMM on tile-contiguous weights: same kernel, tiling and K split as _cbf_lm_partials ----
 @triton.jit
 def _cbf_lm_partials_tiled(x_desc, w_desc, part_ptr, out_ptr, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                        BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr):
@@ -818,12 +817,12 @@ def _cbf_dispatch(x, layer, n, state):
         if state["cbf_pdl_ok"]:
             try:
                 return _cbf_launch_router_pdl(x, n, state, CBF_ROUTER_HILO[m])
-            except Exception as exc:  # first use happens before capture; c043's launches serve the router from then on
+            except Exception as exc:  # first use happens before capture; the plain two-kernel launches serve the router from then on
                 state["cbf_pdl_ok"] = False
                 print("c047: dependent launch unavailable (%s: %s); the router keeps c043's launches" % (type(exc).__name__, exc))
         return _cbf_launch_router(x, n, state, CBF_ROUTER_HILO[m])
     if m == 128 and layer == "pooler":
-        # cuBLAS on swapped operands; the column-major view has the required shape and dtype (jobs h38, h54b)
+        # cuBLAS on swapped operands; the column-major view has the required shape and dtype
         return torch.mm(state[layer][:n], x.t()).t()
     if m == 128 and layer == "qkv_gate" and "cbf_tiled_lm" in state:
         return _cbf_launch_lm_tiled(x, state["cbf_tiled_lm"][layer], n, state, CBF_LM128[layer])
@@ -835,7 +834,7 @@ def _cbf_dispatch(x, layer, n, state):
         if state["cbf_cluster_ok"] and TensorDescriptor is not None:
             try:
                 return _cbf_launch_cluster(x, state[layer][:n], n, state, CBF_CLUSTER_UNPOOL8, 16)
-            except Exception as exc:  # first use happens before capture; c043's kernels serve from then on
+            except Exception as exc:  # first use happens before capture; the global-reduction streaming kernel serves from then on
                 state["cbf_cluster_ok"] = False
                 print("c048: cluster kernel unavailable (%s: %s); c043's kernels serve" % (type(exc).__name__, exc))
         return _cbf_launch(x, state[layer][:n], n, state, CBF_UNPOOL8, 16)
@@ -846,7 +845,7 @@ def _cbf_dispatch(x, layer, n, state):
     if layer == "qkv_gate" and 1 < m <= 32 and state["cbf_cluster_ok"] and TensorDescriptor is not None:
         try:
             return _cbf_launch_cluster(x, state[layer][:n], n, state, CBF_CLUSTER, max(16, triton.next_power_of_2(m)))
-        except Exception as exc:  # first use happens before capture; c043's kernels serve qkv_gate from then on
+        except Exception as exc:  # first use happens before capture; the non-cluster kernels serve qkv_gate from then on
             state["cbf_cluster_ok"] = False
             print("c046: cluster kernel unavailable (%s: %s); qkv_gate keeps c043's kernels" % (type(exc).__name__, exc))
     if 16 < m and layer in CBF_TMA32 and TensorDescriptor is not None:
@@ -1134,8 +1133,7 @@ def _pooler_single_token(X, W, Y, K: tl.constexpr, N: tl.constexpr,
 def kernel_fn(data, state):
     x, layer = data["x"], data["config"]["layer"]
     out = _cbf_dispatch(x, layer, data["config"]["n"], state)
-    if out is not None:  # claude-bf16 qkv_gate at 1-16 tokens (CBF_ENABLED), pooler at 2-32 tokens (CBF_TMA),
-        # unpooler at one token (CBF_GEMV1)
+    if out is not None:  # served by one of the kernels above (see _cbf_dispatch)
         return out
     if layer == "pooler" and x.shape[0] == 1:
         weight = state["pooler"]
