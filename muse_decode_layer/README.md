@@ -31,7 +31,8 @@ by fixed shape tables (no data-dependent choice). The main pieces:
 
 **Attention**
 - On sm_90, attention for most cases runs as one fused kernel per layer (q/k norm, RoPE, FP8 cache store, attention,
-  RMSNorm x sigmoid(gate)), adapted from the [`muse_attention_decode`](../muse_attention_decode) solution:
+  RMSNorm x sigmoid(gate)), using the same techniques as the [`muse_attention_decode`](../muse_attention_decode)
+  solution (the Gluon full-decode kernels have the same function bodies as that file's):
   the Triton split-K kernels behind `_fused` (`_fused_attn`, with an exact last-arriver log-sum-exp merge) on
   sliding layers, the Gluon
   `_gluon_full_decode` (`mma_v2`, `cp.async` pipeline) for full-attention decode at `B >= 16`, and the
@@ -47,8 +48,8 @@ by fixed shape tables (no data-dependent choice). The main pieces:
 - 8-32 tokens: swap-AB Triton GEMMs (`_gemm_swap`, weight rows on the MMA M side), with split-K into an FP32 buffer
   plus a reduce kernel where it measured faster (`SWAP_CFG`).
 - The unpooler slice at 2-8 tokens: split-K reduced inside a thread-block cluster through distributed shared memory,
-  written straight into the zero-padded output rows (the cluster kernel of [`muse_bf16_proj`](../muse_bf16_proj),
-  with an output row stride).
+  written straight into the zero-padded output rows (the same technique as the cluster kernel of
+  [`muse_bf16_proj`](../muse_bf16_proj), with an output row stride).
 - The pooler at 128 and 256 tokens: pinned cuBLASLt algorithms called through `ctypes` (`_lt_prepare`, `_lt_dense`).
   Each plan is rebuilt in `prepare()` from its recorded configuration and used only if the rebuilt algorithm is
   byte-equal to the recorded one, `cublasLtMatmulAlgoCheck` accepts it, and a fixed self-test input reproduces the
@@ -56,8 +57,8 @@ by fixed shape tables (no data-dependent choice). The main pieces:
 
 **Router and routing**
 - The router and `FusedMuseSparkRouting` run on a side stream, overlapping the pooler on the main stream. At one
-  token the router is the FP32 GEMV of `muse_bf16_proj`; at 8 tokens a dedicated FP32 kernel (`_router_eight`);
-  above 8 tokens a one-launch split-K kernel on BF16 hi + lo halves of the FP32 weight with FP32 accumulation
+  token the router is the same FP32 GEMV kernel as in `muse_bf16_proj` (`_cbf_gemv_rows32`, same function body);
+  at 8 tokens a dedicated FP32 kernel (`_router_eight`); above 8 tokens a one-launch split-K kernel on BF16 hi + lo halves of the FP32 weight with FP32 accumulation
   (`_router_hilo`). For `T > 1` the expert grouping (`_grouped_route`; from 128 tokens a multi-CTA `_route2_mc`
   that reproduces the single-CTA sort exactly) also runs on the side stream.
 
@@ -67,8 +68,8 @@ by fixed shape tables (no data-dependent choice). The main pieces:
   to arrive (release/acquire atomics) reduces the FP32 partials in a fixed order. Weights are read from per-(expert,
   tile) contiguous k-block records (`_segf_layouts`, exact byte permutations made and inverse-checked in `prepare()`,
   with a fallback to the plain layout if the check fails).
-- More tokens (`_grouped_experts`): the grouped Gluon NVFP4 kernels of [`muse_moe_w4a16`](../muse_moe_w4a16), with
-  in-register E2M1 x E4M3 decode, tile-major / interleaved / gate-up-paired weight copies per token count, W2 split
+- More tokens (`_grouped_experts`): grouped Gluon NVFP4 kernels using the same techniques as
+  [`muse_moe_w4a16`](../muse_moe_w4a16), with in-register E2M1 x E4M3 decode, tile-major / interleaved / gate-up-paired weight copies per token count, W2 split
   over K at 8-32 tokens with the FP32 partials summed in the post-expert kernel, and per-item 8/16/32-row token tiles
   from 128 tokens.
 - The post-expert norm and weighted sum: a slot-parallel form (rstd per slot, then a PDL elementwise combine) at

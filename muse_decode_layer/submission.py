@@ -778,7 +778,7 @@ def _router_hilo(x, hi_t, lo_t):
 
 
 
-# ---- split-K full-attention decode kernels (adapted from the muse_attention_decode kernels) ----
+# ---- split-K full-attention decode kernels (the same technique as the muse_attention_decode solution) ----
 
 @triton.jit
 def _full_partition_kernel(Q, K, V, PT, POS, KS, VS, PART, LSE,
@@ -1182,7 +1182,8 @@ def _router_eight(router_input, w):
                                router_input.stride(1), w.stride(0), TILE_K=1024, num_warps=8)
     return out
 
-# ---- Gluon full-attention decode (adapted from the muse_attention_decode kernels) ----
+# ---- Gluon full-attention decode and verify kernels (the same technique as the muse_attention_decode solution;
+# the full-decode kernels have the same function bodies as that file's) ----
 _COUNTERS = {}
 
 
@@ -1639,7 +1640,7 @@ def _gluon_full_decode(data, cfg, qkv, tokens, fc):
     return out.view(batch, 1, hq * d)
 
 
-# ---- fused attention for sliding and full layers (adapted from the muse_attention_decode kernels) ----
+# ---- fused attention for sliding and full layers (the same technique as the muse_attention_decode solution) ----
 MERGE_ELEMS = tl.constexpr(16384)   # partial elements loaded per step of the last-arrival merge (raised from 4096 to 16384 on the H200)
 
 @triton.jit
@@ -2133,7 +2134,7 @@ def _fused(data, cfg, qkv, tokens, cos_sin):
     return out.view(batch, length, hq * d)
 
 
-# ---- one-token (DIRECT-mode) grouped NVFP4 W13/W2 kernels (as in the muse_moe_w4a16 solution), renamed for this layer ----
+# ---- one-token (DIRECT-mode) grouped NVFP4 W13/W2 kernels (the same technique as the muse_moe_w4a16 solution) ----
 @gluon.jit
 def _w13_silu_d1(x_ptr, w_ptr, sf_ptr, gs_ptr, sorted_ptr, work_ptr, nwork_ptr, out_ptr,
               K: gl.constexpr, I: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, BM: gl.constexpr,
@@ -2825,7 +2826,8 @@ def _gemm(x, w, out=None, pref=False):
     return _bf16_gemm_dispatch_impl(x, w, None)
 
 
-# ---- projection kernels adapted from the muse_bf16_proj solution (this block through "end of block"). Served only at
+# ---- small-m projection kernels, the same technique as the muse_bf16_proj solution (this block through "end of
+# block"). Served only at
 # LANEB_DONOR's (layer, tokens) pairs (fixed-shape branch), measured faster than this layer's own path on the H200.
 # Its split-K kernels share one partials buffer and
 # self-resetting counters: they run only on the main stream, one at a time (the side stream's router never uses them).
@@ -2906,9 +2908,9 @@ def _cbf_launch(x, w, n, state, cfg, block_m):
 
 # Streaming MMA: (layer, m bucket 16 = 1-16 tokens, 32 = 17-32 tokens) -> BLOCK_N, BLOCK_K, SPLIT_K, warps, stages.
 CBF_STREAM = {
-    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 vs SGLang at m=1)
-    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200: 1.08 / 1.10 vs SGLang at m8 / m16)
-    ("o", 32): (64, 128, 1, 4, 4),            # H200: 1.08 vs SGLang at m32
+    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (chosen by H200 measurement against SGLang at m=1)
+    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (chosen by H200 measurement against SGLang at m8 / m16)
+    ("o", 32): (64, 128, 1, 4, 4),            # chosen by H200 measurement against SGLang at m32
 }
 # Cases served: qkv_gate at 1-16 tokens (one token runs the same 16-wide MMA tile).
 CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
@@ -2989,7 +2991,7 @@ def _cbf_launch_tma(x, w, w2, n, state, cfg, block_m, out_dtype):
 
 # layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, served at 2-32 tokens (BLOCK_M = tokens rounded up
 # to a power of two, at least 16)
-# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200: 1.068 vs SGLang)
+# qkv_gate at 17-32 tokens on the TMA streaming kernel (chosen by H200 measurement against SGLang)
 CBF_TMA32 = {"qkv_gate": (64, 128, 3, 4, 4)}
 CBF_TMA = {
     "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200: 5-6% faster than (32, 128, 2, 4, 5))
@@ -3082,7 +3084,7 @@ def _cbf_launch_gemv32(x, w, n, state, cfg, out_dtype):
 
 
 # Router at one token: FP32 weights as given, one row per program, 16 warps, no K split
-# (H200: 2.701 against SGLang)
+# (chosen by H200 measurement against SGLang)
 CBF_ROUTER1 = (1, 2048, 1, 16, 1)
 
 
@@ -3284,7 +3286,7 @@ def _cbf_dispatch(x, layer, n, state):
     if cfg is None:
         return None
     return _cbf_launch(x, state[layer][:n], n, state, cfg, max(16, triton.next_power_of_2(m)))
-# ---- end of the muse_bf16_proj block ----
+# ---- end of the small-m projection block ----
 
 LANEB_DONOR = {('router', 1)}
 
@@ -3334,7 +3336,7 @@ def _cbf_skinny_gemm_so(x_ptr, w_ptr, out_ptr, part_ptr, cnt_ptr, M, N, K, OUT_S
 
 
 def _laneb_prepare(state, weights):
-    """State for the muse_bf16_proj block: the layer weights (the same tensors as state["dense"], no copy) and its scratch."""
+    """State for the small-m projection block: the layer weights (the same tensors as state["dense"], no copy) and its scratch."""
     dense = state["dense"]
     cbf = {name: dense[name] for name in ("qkv_gate", "o", "pooler", "unpooler")}
     cbf.update(router=state["router"], router_hi_t=state["router_hi_t"], router_lo_t=state["router_lo_t"])
@@ -3493,7 +3495,7 @@ def _lt_dense(x, layer, state):
 
 
 def _dense(x, layer, state, out=None, pref=False):
-    """The projection for this layer: the muse_bf16_proj kernels at LANEB_DONOR's pairs, else this layer's _gemm."""
+    """The projection for this layer: the small-m projection kernels at LANEB_DONOR's pairs, else this layer's _gemm."""
     t = x.shape[0]
     if (layer, t) in LANEB_DONOR and x.is_contiguous():
         cbf = state["cbf"]
@@ -3540,7 +3542,7 @@ def _router_logits(x, t, state):
     return _cbf_launch_router(x, cbf["router"].shape[0], cbf, CBF_ROUTER_HILO[t])
 
 
-# ---- cluster DSMEM split-K for small-m dense (the muse_bf16_proj cluster kernel, with an output row stride) ----
+# ---- cluster DSMEM split-K for small-m dense (the same technique as the muse_bf16_proj cluster kernel, with an output row stride) ----
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor as _B3CL_TD
 except Exception:  # older Triton
@@ -3773,7 +3775,7 @@ def prepare(weights):
     for op in (state["attn_boundary"], state["ffn_boundary"]):
         op._ensure_cached_weights(torch.bfloat16)
     state["grouped"] = _grouped_prepare(weights)  # grouped NVFP4 expert weights
-    state["cbf"] = _laneb_prepare(state, weights)  # muse_bf16_proj block state
+    state["cbf"] = _laneb_prepare(state, weights)  # small-m projection block state
     state["d1_buf"] = torch.full((1 + TOP_K,), -1, dtype=torch.int32, device=device)  # one-token expert slot buffer
     # split-K partials (up to 16 splits) and per-tile arrival counters (each last arriver resets its own)
     state["d1s_part13"] = torch.empty(TOP_K * (D_EXPERT // BN) * 16 * 2 * BN, dtype=torch.float32, device=device)

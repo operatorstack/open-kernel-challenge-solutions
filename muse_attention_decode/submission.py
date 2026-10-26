@@ -80,8 +80,8 @@ class Inputs(TypedDict):
 
 
 RMS_EPS = 1e-5
-MERGE_ELEMS = tl.constexpr(16384)   # partial elements loaded per step of the last-arrival merge (h058/h059: 4096 -> 16384
-# saves 3-5% on the latency-bound B1/B16 cases; 32768 costs batch-16 sliding verify)
+MERGE_ELEMS = tl.constexpr(16384)   # partial elements loaded per step of the last-arrival merge (raising it from 4096 to 16384
+# saved 3-5% on the latency-bound B1/B16 cases; 32768 was slower on batch-16 sliding verify)
 FP8 = torch.float8_e4m3fn
 _ROPE = {}
 ROPE_POSITIONS = 1 << 21
@@ -982,8 +982,8 @@ FUSED_CFG = {
     ("full", 1): dict(block_n=128, warps=4, stages=5, max_split=128, per_sm=2, prefetch=False, min_chunk=256,
                       small=dict(hpb=1, per_sm=4, stages=3, prefetch=True, gluon=False, gate_pre=False), big=dict(per_sm=4),
                       big_min_batch=32, gluon=True, g_block_n=128, g_stages=3, g_warps=4, g_per_sm=4),
-    # Full verify at batch >= 16 (fused since h070: 64 query rows per KV head, wgmma-sized, FP8 QK, 128-key
-    # tiles; faster than the FA3 path in-job on the H200 by 6-7%); batch <= 4 keeps FA3 (a tie, h070).
+    # Full verify at batch >= 16 (fused: 64 query rows per KV head, wgmma-sized, FP8 QK, 128-key
+    # tiles; faster than the FA3 path on the H200 by 6-7%); batch <= 4 keeps FA3 (a tie).
     ("full", 8): dict(block_n=128, warps=4, stages=3, max_split=8, per_sm=4, prefetch=True, min_chunk=256,
                       row_blocks=1, qk8=True, big=dict(per_sm=8), big_min_batch=32,
                       small=dict(block_n=64, max_split=128, per_sm=8, gluon_v=False),

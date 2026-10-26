@@ -156,9 +156,9 @@ def _cbf_launch(x, w, n, state, cfg, block_m):
 
 # Streaming MMA: (layer, m bucket 16 = 1-16 tokens, 32 = 17-32 tokens) -> BLOCK_N, BLOCK_K, SPLIT_K, warps, stages.
 CBF_STREAM = {
-    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (H200: 1.093 vs SGLang at m=1)
-    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (H200: 1.08 / 1.10 vs SGLang at m8 / m16)
-    ("o", 32): (64, 128, 1, 4, 4),            # H200: 1.08 vs SGLang at m32
+    ("qkv_gate", 16): (32, 64, 11, 4, 4),     # 72 tiles x 11 K ranges = 792 programs (chosen by H200 measurement against SGLang at m=1)
+    ("o", 16): (64, 128, 1, 4, 4),            # 128 tiles, no K split (chosen by H200 measurement against SGLang at m8 / m16)
+    ("o", 32): (64, 128, 1, 4, 4),            # chosen by H200 measurement against SGLang at m32
 }
 # Cases served: qkv_gate at 1-16 tokens (one token runs the same 16-wide MMA tile).
 CBF_ENABLED = {("qkv_gate", 1), ("qkv_gate", 16), ("o", 16), ("o", 32)}
@@ -239,7 +239,7 @@ def _cbf_launch_tma(x, w, w2, n, state, cfg, block_m, out_dtype):
 
 # layer -> BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages, served at 2-32 tokens (BLOCK_M = tokens rounded up
 # to a power of two, at least 16)
-# qkv_gate at 17-32 tokens on the TMA streaming kernel (H200: 1.068 vs SGLang)
+# qkv_gate at 17-32 tokens on the TMA streaming kernel (chosen by H200 measurement against SGLang)
 CBF_TMA32 = {"qkv_gate": (64, 128, 3, 4, 4)}
 CBF_TMA = {
     "pooler": (32, 256, 1, 4, 5),     # 128 programs, no K split (H200: 5-6% faster than (32, 128, 2, 4, 5))
@@ -332,7 +332,7 @@ def _cbf_launch_gemv32(x, w, n, state, cfg, out_dtype):
 
 
 # Router at one token: FP32 weights as given, one row per program, 16 warps, no K split
-# (H200: 2.701 against SGLang)
+# (chosen by H200 measurement against SGLang)
 CBF_ROUTER1 = (1, 2048, 1, 16, 1)
 
 

@@ -58,9 +58,9 @@ weights, and `kernel_fn(...)`, the timed call. They need an SM90 GPU, PyTorch, T
 ## Verifying the code against the judged files
 
 `SHA256SUMS` lists the SHA-256 hashes of the files exactly as the judge ran them; they match `submission_sha256` in
-each `RESULT.json`. The comments and docstrings of three files (`muse_decode_layer`, `muse_moe_w4a16`,
-`muse_bf16_proj`) were edited for publication, so those three no longer match the hashes byte for byte;
-`muse_attention_decode/submission.py` is unchanged and does. No executable code was changed:
+each `RESULT.json`. The comments and docstrings of all four files were edited for publication, so the published
+files no longer match those hashes byte for byte; each folder's README gives both hashes. No executable code was
+changed:
 `verify/check_equivalence.py` parses two files, removes every docstring and compares the syntax trees (comments are
 not part of the tree):
 

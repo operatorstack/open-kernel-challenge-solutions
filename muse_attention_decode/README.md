@@ -59,11 +59,14 @@ Source: [`RESULT.json`](RESULT.json). Per-case pass counts are not recorded in i
 
 ## Verify
 
-`submission.py` is byte-identical to the judged file.
+`submission.py` differs from the judged file only in comments.
 
-- SHA-256 of the judged file: `cbded556842cb511642b4d56fd6fb4b27c33336d41812ba0b630a3727fcac8c3`
+- SHA-256 of the judged file (reference): `cbded556842cb511642b4d56fd6fb4b27c33336d41812ba0b630a3727fcac8c3`
+- SHA-256 of the published `submission.py`: `4a44fe09fdc938999ce8ea7c5b2641fef852b13dd7404d1c852a1a07f25eda21`
 - Judge content hash: `7a72333ffe43d9f566deec637df0d82e9e9b9c2eab50b8f2a2dcfa0da0c54029`
 
-    sha256sum muse_attention_decode/submission.py
+With a copy of the judged file (it matches the reference SHA-256 above):
 
-`verify/check_equivalence.py` also reports `EQUIVALENT` for it against the judged file.
+    python verify/check_equivalence.py judged_submission.py muse_attention_decode/submission.py
+
+prints `EQUIVALENT` when the two files have the same syntax tree once docstrings are removed.
