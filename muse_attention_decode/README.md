@@ -62,7 +62,7 @@ Source: [`RESULT.json`](RESULT.json). Per-case pass counts are not recorded in i
 `submission.py` differs from the judged file only in comments.
 
 - SHA-256 of the judged file (reference): `cbded556842cb511642b4d56fd6fb4b27c33336d41812ba0b630a3727fcac8c3`
-- SHA-256 of the published `submission.py`: `52e71251fb86305d2d1fd0b9bfa8c81eb3717144bb5553ca0241d40809d5ea06`
+- SHA-256 of the published `submission.py`: `c5a94b6031bd1df0392773dcee7501a5dcc0d6de8e28eda4cec6d2109e29ad64`
 - Judge content hash: `7a72333ffe43d9f566deec637df0d82e9e9b9c2eab50b8f2a2dcfa0da0c54029`
 
 With a copy of the judged file (it matches the reference SHA-256 above):

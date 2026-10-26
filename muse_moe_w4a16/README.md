@@ -69,7 +69,7 @@ Source: [`RESULT.json`](RESULT.json). Per-case pass counts are not recorded in i
 - Judge content hash: `5e7f7995d62957d2b75b156be699141a14a59c8b8d1ad38fc878761c41231965`
 - SHA-256 of the published `submission.py`: `281d56e94d22f7ebb440274d25c240697b4728af2586da252fb1befb1f35cc35`
 
-With a copy of the judged file (it matches the SHA-256 above):
+With a copy of the judged file (it matches the judged file's SHA-256 above):
 
     python verify/check_equivalence.py judged_submission.py muse_moe_w4a16/submission.py
 
