@@ -1,0 +1,25 @@
+{
+  "problem": "muse_moe_w4a16",
+  "team": "bigboateng",
+  "official_job": "c33ef77ff5f14a25",
+  "gpu": "H200",
+  "status": "done",
+  "passed": true,
+  "speedup": 1.8320356659153298,
+  "speedup_ci95": [
+    1.8045551309266,
+    1.8595162009040596
+  ],
+  "score_us": 7340.741367761964,
+  "baseline_us": 13448.5,
+  "submitted_at": "2026-10-25T04:13:11Z",
+  "finished_at": "2026-10-25T04:16:29Z",
+  "submission_sha256": "8a48f0f100ccf5fc9878c122037969296841d1315474d9807c218698037aa773",
+  "judge_content_hash": "5e7f7995d62957d2b75b156be699141a14a59c8b8d1ad38fc878761c41231965",
+  "evaluator_code_sha256": "afcead6a6ff090aa50fe9bc907f0fa8f4ba73d95fa92af93ec260b5e8ff00f00",
+  "board_rank_snapshot": {
+    "rank": 217,
+    "of": 794,
+    "at": "2026-10-26T01:41Z"
+  }
+}

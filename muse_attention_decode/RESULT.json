@@ -1,0 +1,25 @@
+{
+  "problem": "muse_attention_decode",
+  "team": "bigboateng",
+  "official_job": "82034c2594ca4e55",
+  "gpu": "H200",
+  "status": "done",
+  "passed": true,
+  "speedup": 1.8228232631342118,
+  "speedup_ci95": [
+    1.7954809141871986,
+    1.8563559504983023
+  ],
+  "score_us": 2066.1904399465047,
+  "baseline_us": 3766.3,
+  "submitted_at": "2026-10-25T03:54:06Z",
+  "finished_at": "2026-10-25T04:01:34Z",
+  "submission_sha256": "cbded556842cb511642b4d56fd6fb4b27c33336d41812ba0b630a3727fcac8c3",
+  "judge_content_hash": "7a72333ffe43d9f566deec637df0d82e9e9b9c2eab50b8f2a2dcfa0da0c54029",
+  "evaluator_code_sha256": "1d519ebf2014fef91b41ffea9bcd7e9c5066784ef5a2a5e2cf06a8cec554d188",
+  "board_rank_snapshot": {
+    "rank": 196,
+    "of": 752,
+    "at": "2026-10-26T01:41Z"
+  }
+}

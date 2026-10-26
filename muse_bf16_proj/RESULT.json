@@ -1,0 +1,25 @@
+{
+  "problem": "muse_bf16_proj",
+  "team": "bigboateng",
+  "official_job": "e13efd213bdc4af3",
+  "gpu": "H200",
+  "status": "done",
+  "passed": true,
+  "speedup": 1.3066068869345255,
+  "speedup_ci95": [
+    1.2870077836305076,
+    1.3262059902385432
+  ],
+  "score_us": 3697.2099629244285,
+  "baseline_us": 4830.8,
+  "submitted_at": "2026-10-25T02:23:05Z",
+  "finished_at": "2026-10-25T02:33:22Z",
+  "submission_sha256": "d5d2023c75ba41956742366f5f9d8b02d5694ecdc64e90593efb7c1d2bfbcac7",
+  "judge_content_hash": "798bebff2b12fb27bd4e91e4d7eafd62c18a19d2a936b4f8ab15bd63612dfac9",
+  "evaluator_code_sha256": "986ed3ebb096eab83d16797609f4c0e7895248d6bce33252d25dd306cbe5d018",
+  "board_rank_snapshot": {
+    "rank": 196,
+    "of": 1019,
+    "at": "2026-10-26T01:41Z"
+  }
+}
