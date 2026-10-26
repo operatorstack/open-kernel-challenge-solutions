@@ -28,6 +28,8 @@ muse_decode_layer/submission.py
     (sglang/kernels/ops/muse_spark_v12/fused_post_expert_norm_weighted_sum_triton.py),
     with programmatic dependent launch added, and with an optional sum of FP32
     split-K partials before the norm.
+  - _router_hilo uses the same hi/lo split with FP32 accumulation as
+    MuseSpark1xRouter.forward_split2.
   - _rms_norm_local_ids_kernel reimplements SGLang's single-CTA
     moe_align_small_numel algorithm (same "+1 offset" buckets) inside the
     pre-expert norm kernel.
